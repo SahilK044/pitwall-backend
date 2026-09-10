@@ -15,6 +15,7 @@ Powers real-time telemetry, live leaderboards, and session tracking for the **Pi
 ## 🚀 Public Endpoints
 - `GET /` — API overview and health
 - `GET /health` — Health check
+- `GET /privacy` — Public official Pitwall Privacy Policy page (HTML)
 - `GET /api/v1/live/timing` — Live leaderboard, gaps, intervals, and tire stints
 - `GET /api/v1/live/weather` — Live track and air temperature, rain probability
 - `GET /api/v1/live/race_control` — Safety Car, Virtual Safety Car, and flag notices

@@ -1,7 +1,11 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI, Response
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from live_engine import engine
+
+PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,12 +34,24 @@ async def root():
         "service": "Pitwall LiveF1 Engine",
         "status": "online",
         "version": "1.0.0",
-        "documentation": "/docs"
+        "documentation": "/docs",
+        "privacy_policy": "/privacy"
     }
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "pitwall-livef1"}
+
+@app.api_route("/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def privacy_policy():
+    if PRIVACY_HTML_PATH.exists():
+        content = PRIVACY_HTML_PATH.read_text(encoding="utf-8")
+        return HTMLResponse(
+            content=content,
+            status_code=200,
+            headers={"Cache-Control": "public, max-age=3600"}
+        )
+    return HTMLResponse(content="<h1>Privacy Policy Not Found</h1>", status_code=404)
 
 @app.get("/api/v1/live/timing")
 async def get_live_timing(response: Response):
