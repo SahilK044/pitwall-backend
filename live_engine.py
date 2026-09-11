@@ -225,22 +225,6 @@ class LiveF1Engine:
     async def get_live_timing(self) -> Dict[str, Any]:
         """Returns the active live session timing, positions, and interval gaps."""
         with self._state_lock:
-            if not self._timing_lines:
-                session_name = self._session_info.get("Name", "Practice 1")
-                meeting = self._session_info.get("Meeting", {})
-                circuit_name = meeting.get("Circuit", {}).get("ShortName", "Circuit")
-                country_name = meeting.get("Country", {}).get("Name", "Grand Prix")
-                return {
-                    "status": "inactive" if self._last_event_time == 0 else "live",
-                    "session_name": session_name,
-                    "circuit_short_name": circuit_name,
-                    "country_name": country_name,
-                    "session_key": self._session_info.get("Key", 20260911),
-                    "message": "Waiting for live timing telemetry...",
-                    "leaderboard": [],
-                    "engine": "livef1-signalr"
-                }
-
             leaderboard = []
             for num_str, line in self._timing_lines.items():
                 try:
