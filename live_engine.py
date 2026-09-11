@@ -23,7 +23,7 @@ DEFAULT_F1TV_TOKEN = (
 KNOWN_DRIVERS_2026 = {
     1: {"broadcast_name": "L. NORRIS", "name_acronym": "NOR", "team_name": "McLaren", "team_colour": "FF8000"},
     3: {"broadcast_name": "M. VERSTAPPEN", "name_acronym": "VER", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
-    5: {"broadcast_name": "G. BORTOLETO", "name_acronym": "BOR", "team_name": "Audi F1 Team", "team_colour": "52E252"},
+    5: {"broadcast_name": "G. BORTOLETO", "name_acronym": "BOR", "team_name": "Audi F1 Team", "team_colour": "FF5A5A"},
     6: {"broadcast_name": "I. HADJAR", "name_acronym": "HAD", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
     7: {"broadcast_name": "J. DOOHAN", "name_acronym": "DOO", "team_name": "Alpine", "team_colour": "0090FF"},
     10: {"broadcast_name": "P. GASLY", "name_acronym": "GAS", "team_name": "Alpine", "team_colour": "0090FF"},
@@ -34,7 +34,7 @@ KNOWN_DRIVERS_2026 = {
     18: {"broadcast_name": "L. STROLL", "name_acronym": "STR", "team_name": "Aston Martin", "team_colour": "229971"},
     22: {"broadcast_name": "Y. TSUNODA", "name_acronym": "TSU", "team_name": "Racing Bulls", "team_colour": "6692FF"},
     23: {"broadcast_name": "A. ALBON", "name_acronym": "ALB", "team_name": "Williams", "team_colour": "64C4FF"},
-    27: {"broadcast_name": "N. HULKENBERG", "name_acronym": "HUL", "team_name": "Audi F1 Team", "team_colour": "52E252"},
+    27: {"broadcast_name": "N. HULKENBERG", "name_acronym": "HUL", "team_name": "Audi F1 Team", "team_colour": "FF5A5A"},
     30: {"broadcast_name": "L. LAWSON", "name_acronym": "LAW", "team_name": "Racing Bulls", "team_colour": "6692FF"},
     31: {"broadcast_name": "E. OCON", "name_acronym": "OCO", "team_name": "Haas", "team_colour": "B6BABD"},
     41: {"broadcast_name": "A. LINDBLAD", "name_acronym": "LIN", "team_name": "Racing Bulls", "team_colour": "6692FF"},
