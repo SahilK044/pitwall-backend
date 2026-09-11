@@ -318,6 +318,45 @@ class LiveF1Engine:
                     "in_pit": in_pit
                 })
 
+            present_numbers = {int(k) for k in self._timing_lines.keys() if k.isdigit()}
+            # Guarantee the full 22-car 2026 grid is represented (in-pit cars with no laps set)
+            OFFICIAL_GRID_2026_NUMBERS = [
+                1, 81,       # McLaren (Norris, Piastri)
+                16, 44,      # Ferrari (Leclerc, Hamilton)
+                63, 12,      # Mercedes (Russell, Antonelli)
+                3, 6,        # Red Bull (Verstappen, Hadjar)
+                23, 55,      # Williams (Albon, Sainz)
+                14, 18,      # Aston Martin (Alonso, Stroll)
+                10, 43,      # Alpine (Gasly, Colapinto)
+                31, 87,      # Haas (Ocon, Bearman)
+                30, 41,      # Racing Bulls (Lawson, Lindblad)
+                27, 5,       # Audi F1 Team (Hulkenberg, Bortoleto)
+                11, 77       # Cadillac Formula 1 Team (Perez, Bottas)
+            ]
+            next_pos = len(leaderboard) + 1
+            for num in OFFICIAL_GRID_2026_NUMBERS:
+                if num not in present_numbers:
+                    meta = self._get_driver_meta(num)
+                    leaderboard.append({
+                        "position": next_pos,
+                        "driver_number": num,
+                        "broadcast_name": meta["broadcast_name"],
+                        "name_acronym": meta["name_acronym"],
+                        "team_name": meta["team_name"],
+                        "team_colour": meta["team_colour"],
+                        "last_lap_time": "",
+                        "best_lap_time": "",
+                        "gap_to_leader": "NO TIME",
+                        "interval": "--",
+                        "sector1": "",
+                        "sector2": "",
+                        "sector3": "",
+                        "speed_trap": "",
+                        "laps": 0,
+                        "in_pit": True
+                    })
+                    next_pos += 1
+
             leaderboard.sort(key=lambda x: x["position"])
 
             meeting = self._session_info.get("Meeting", {})
