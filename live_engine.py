@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -23,9 +24,9 @@ KNOWN_TEAM_COLOURS = {
     "red bull racing": "3671C6",
     "red bull": "3671C6",
     "racing bulls": "6692FF",
-    "rb": "6692FF",
-    "vcarb": "6692FF",
     "visa cash app rb": "6692FF",
+    "vcarb": "6692FF",
+    "rb": "6692FF",
     "mclaren": "FF8000",
     "ferrari": "E80020",
     "mercedes": "00D2BE",
@@ -33,10 +34,10 @@ KNOWN_TEAM_COLOURS = {
     "alpine": "0090FF",
     "williams": "64C4FF",
     "haas": "B6BABD",
-    "audi": "FF5A5A",
     "audi f1 team": "FF5A5A",
-    "cadillac": "D4AF37",
+    "audi": "FF5A5A",
     "cadillac formula 1 team": "D4AF37",
+    "cadillac": "D4AF37",
     "kick sauber": "52E252",
     "sauber": "52E252",
 }
@@ -75,7 +76,7 @@ KNOWN_DRIVERS_2026 = {
     22: {"broadcast_name": "Y. TSUNODA", "name_acronym": "TSU", "team_name": "Racing Bulls", "team_colour": "6692FF"},
     23: {"broadcast_name": "A. ALBON", "name_acronym": "ALB", "team_name": "Williams", "team_colour": "64C4FF"},
     27: {"broadcast_name": "N. HULKENBERG", "name_acronym": "HUL", "team_name": "Audi F1 Team", "team_colour": "FF5A5A"},
-    30: {"broadcast_name": "L. LAWSON", "name_acronym": "LAW", "team_name": "Racing Bulls", "team_colour": "6692FF"},
+    30: {"broadcast_name": "L. LAWSON", "name_acronym": "LAW", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
     31: {"broadcast_name": "E. OCON", "name_acronym": "OCO", "team_name": "Haas", "team_colour": "B6BABD"},
     41: {"broadcast_name": "A. LINDBLAD", "name_acronym": "LIN", "team_name": "Racing Bulls", "team_colour": "6692FF"},
     43: {"broadcast_name": "F. COLAPINTO", "name_acronym": "COL", "team_name": "Alpine", "team_colour": "0090FF"},
@@ -206,9 +207,20 @@ class LiveF1Engine:
                 if topic == "SessionInfo" and isinstance(payload, dict):
                     self._session_info.update(payload)
 
-                elif topic == "DriverList" and isinstance(payload, dict):
-                    for num_str, d_info in payload.items():
-                        if isinstance(d_info, dict):
+                elif topic == "DriverList":
+                    drivers_data = []
+                    if isinstance(payload, dict):
+                        if "Drivers" in payload and isinstance(payload["Drivers"], dict):
+                            drivers_data = list(payload["Drivers"].items())
+                        elif "Drivers" in payload and isinstance(payload["Drivers"], list):
+                            drivers_data = [(str(d.get("RacingNumber", "")), d) for d in payload["Drivers"] if isinstance(d, dict)]
+                        else:
+                            drivers_data = list(payload.items())
+                    elif isinstance(payload, list):
+                        drivers_data = [(str(d.get("RacingNumber", "")), d) for d in payload if isinstance(d, dict)]
+
+                    for num_str, d_info in drivers_data:
+                        if isinstance(d_info, dict) and num_str:
                             self._driver_list.setdefault(str(num_str), {}).update(d_info)
                             try:
                                 clean_key = str(int(num_str))
@@ -263,7 +275,7 @@ class LiveF1Engine:
             else:
                 target[k] = v
 
-    def _get_driver_meta(self, num: int) -> Dict[str, str]:
+    def _get_driver_meta(self, num: int, line: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
         known = KNOWN_DRIVERS_2026.get(num, {})
         num_str = str(num)
         raw = self._driver_list.get(num_str, {})
@@ -286,11 +298,15 @@ class LiveF1Engine:
 
         # Live feed team ALWAYS takes priority over hardcoded dictionary!
         team_name = str(raw.get("TeamName") or "").strip()
+        if not team_name and line:
+            team_name = str(line.get("TeamName") or line.get("Team") or "").strip()
         if not team_name or team_name in ("F1 Team", "Team", "Formula 1"):
             team_name = known.get("team_name", "F1 Team")
 
         # Live feed team colour with fallback to dynamic team lookup
         team_colour = str(raw.get("TeamColour") or "").replace("#", "").strip()
+        if not team_colour and line:
+            team_colour = str(line.get("TeamColour") or "").replace("#", "").strip()
         if not team_colour or team_colour.upper() in ("FFFFFF", "000000"):
             norm_team = team_name.lower().strip()
             for k, col in KNOWN_TEAM_COLOURS.items():
@@ -327,7 +343,7 @@ class LiveF1Engine:
                 except (ValueError, TypeError):
                     pos = 99
 
-                meta = self._get_driver_meta(num)
+                meta = self._get_driver_meta(num, line=line)
 
                 # Lap times
                 last_lap = ""
@@ -345,12 +361,13 @@ class LiveF1Engine:
                     best_lap = best_obj
 
                 # Update driver best lap memory across session
-                if last_lap and parse_lap_str(last_lap) < parse_lap_str(self._driver_best_laps.get(num, "")):
-                    self._driver_best_laps[num] = last_lap
-                if best_lap and parse_lap_str(best_lap) < parse_lap_str(self._driver_best_laps.get(num, "")):
-                    self._driver_best_laps[num] = best_lap
-                if not best_lap and num in self._driver_best_laps:
-                    best_lap = self._driver_best_laps[num]
+                fastest_for_driver = self._driver_best_laps.get(num, "")
+                for cand in (best_lap, last_lap):
+                    if cand and parse_lap_str(cand) < parse_lap_str(fastest_for_driver):
+                        fastest_for_driver = cand
+                if fastest_for_driver:
+                    self._driver_best_laps[num] = fastest_for_driver
+                    best_lap = fastest_for_driver
 
                 # Sectors & Sector states (OverallFastest = SESSION_BEST, PersonalFastest = PERSONAL_BEST, Slower)
                 sectors = line.get("Sectors", {})
@@ -440,14 +457,15 @@ class LiveF1Engine:
                 1, 81,       # McLaren (Norris, Piastri)
                 16, 44,      # Ferrari (Leclerc, Hamilton)
                 63, 12,      # Mercedes (Russell, Antonelli)
-                3, 6,        # Red Bull (Verstappen, Hadjar)
+                3, 30,       # Red Bull (Verstappen, Lawson)
+                22, 41,      # Racing Bulls (Tsunoda, Lindblad)
                 23, 55,      # Williams (Albon, Sainz)
                 14, 18,      # Aston Martin (Alonso, Stroll)
                 10, 43,      # Alpine (Gasly, Colapinto)
                 31, 87,      # Haas (Ocon, Bearman)
-                30, 41,      # Racing Bulls (Lawson, Lindblad)
                 27, 5,       # Audi F1 Team (Hulkenberg, Bortoleto)
-                11, 77       # Cadillac Formula 1 Team (Perez, Bottas)
+                11, 77,      # Cadillac Formula 1 Team (Perez, Bottas)
+                6            # Reserve (Hadjar)
             ]
             next_pos = len(leaderboard) + 1
             for num in OFFICIAL_GRID_2026_NUMBERS:
@@ -483,7 +501,76 @@ class LiveF1Engine:
                     })
                     next_pos += 1
 
-            leaderboard = leaderboard[:22]
+            # Cross-reference Race Control Messages for crashes / stoppages
+            rc_lower = [str(m.get("Message") or "").lower() for m in self._race_control_messages]
+            for d in leaderboard:
+                car_num = d["driver_number"]
+                tla = d["name_acronym"].lower()
+                pattern = re.compile(rf"(?:\bcar\s*{car_num}\b|\b{car_num}\b|\({re.escape(tla)}\))")
+                for rc_text in rc_lower:
+                    if pattern.search(rc_text):
+                        if any(w in rc_text for w in ("crash", "stopped", "off track", "stranded", "accident", "barrier")):
+                            d["is_crashed"] = True
+                            d["is_stopped"] = True
+                        elif any(w in rc_text for w in ("retired", "technical issue", "mechanical failure", "out of session")):
+                            d["is_retired"] = True
+
+            # Compute session-wide fastest sectors across the leaderboard
+            def _sec_to_float(v):
+                if not v or v == "--": return None
+                try:
+                    return float(str(v).replace("+", "").strip())
+                except (ValueError, TypeError):
+                    return None
+
+            s1_vals = [s for s in (_sec_to_float(d.get("sector1")) for d in leaderboard) if s is not None and s > 10.0]
+            min_s1 = min(s1_vals) if s1_vals else None
+
+            s2_vals = [s for s in (_sec_to_float(d.get("sector2")) for d in leaderboard) if s is not None and s > 10.0]
+            min_s2 = min(s2_vals) if s2_vals else None
+
+            s3_vals = [s for s in (_sec_to_float(d.get("sector3")) for d in leaderboard) if s is not None and s > 10.0]
+            min_s3 = min(s3_vals) if s3_vals else None
+
+            for d in leaderboard:
+                # Sector 1
+                s1_f = _sec_to_float(d.get("sector1"))
+                if s1_f is not None:
+                    if min_s1 is not None and abs(s1_f - min_s1) < 0.005:
+                        d["sector1_state"] = "SESSION_BEST"
+                    elif d.get("sector1_state") != "SESSION_BEST":
+                        if (min_s1 is not None and (s1_f - min_s1) <= 0.35) or d.get("position", 99) <= 5:
+                            d["sector1_state"] = "PERSONAL_BEST"
+                        else:
+                            d["sector1_state"] = "SLOWER"
+                else:
+                    d["sector1_state"] = "NONE"
+
+                # Sector 2
+                s2_f = _sec_to_float(d.get("sector2"))
+                if s2_f is not None:
+                    if min_s2 is not None and abs(s2_f - min_s2) < 0.005:
+                        d["sector2_state"] = "SESSION_BEST"
+                    elif d.get("sector2_state") != "SESSION_BEST":
+                        if (min_s2 is not None and (s2_f - min_s2) <= 0.35) or d.get("position", 99) <= 5:
+                            d["sector2_state"] = "PERSONAL_BEST"
+                        else:
+                            d["sector2_state"] = "SLOWER"
+                else:
+                    d["sector2_state"] = "NONE"
+
+                # Sector 3
+                s3_f = _sec_to_float(d.get("sector3"))
+                if s3_f is not None:
+                    if min_s3 is not None and abs(s3_f - min_s3) < 0.005:
+                        d["sector3_state"] = "SESSION_BEST"
+                    elif d.get("sector3_state") != "SESSION_BEST":
+                        if (min_s3 is not None and (s3_f - min_s3) <= 0.35) or d.get("position", 99) <= 5:
+                            d["sector3_state"] = "PERSONAL_BEST"
+                        else:
+                            d["sector3_state"] = "SLOWER"
+                else:
+                    d["sector3_state"] = "NONE"
 
             # In Practice & Qualifying: rank strictly by fastest lap time!
             if is_time_trial:
@@ -494,6 +581,7 @@ class LiveF1Engine:
                     return (1, -d.get("laps", 0), d.get("driver_number", 99))
 
                 leaderboard.sort(key=_sort_key)
+                leaderboard = leaderboard[:22]
 
                 leader_sec = None
                 prev_sec = None
@@ -519,6 +607,7 @@ class LiveF1Engine:
                             d["interval"] = "--"
             else:
                 leaderboard.sort(key=lambda x: x["position"])
+                leaderboard = leaderboard[:22]
 
             track_msg = self._track_status.get("Message", "AllClear")
             rc_msgs = list(self._race_control_messages)
