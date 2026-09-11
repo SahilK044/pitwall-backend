@@ -284,13 +284,32 @@ class LiveF1Engine:
                 elif isinstance(best_obj, str):
                     best_lap = best_obj
 
-                # Sectors
+                # Sectors (can be list or dict with int/str keys in SignalR)
                 sectors = line.get("Sectors", {})
                 s1, s2, s3 = "", "", ""
                 if isinstance(sectors, dict):
-                    s1 = sectors.get("0", {}).get("Value", "") or sectors.get("0", {}).get("PreviousValue", "")
-                    s2 = sectors.get("1", {}).get("Value", "") or sectors.get("1", {}).get("PreviousValue", "")
-                    s3 = sectors.get("2", {}).get("Value", "") or sectors.get("2", {}).get("PreviousValue", "")
+                    def _extract_val(k):
+                        item = sectors.get(k) or sectors.get(str(k)) or {}
+                        if isinstance(item, dict):
+                            return item.get("Value") or item.get("PreviousValue") or ""
+                        elif isinstance(item, str):
+                            return item
+                        return ""
+                    s1 = _extract_val(0)
+                    s2 = _extract_val(1)
+                    s3 = _extract_val(2)
+                elif isinstance(sectors, (list, tuple)):
+                    def _extract_list_val(idx):
+                        if idx < len(sectors):
+                            item = sectors[idx]
+                            if isinstance(item, dict):
+                                return item.get("Value") or item.get("PreviousValue") or ""
+                            elif isinstance(item, str):
+                                return item
+                        return ""
+                    s1 = _extract_list_val(0)
+                    s2 = _extract_list_val(1)
+                    s3 = _extract_list_val(2)
 
                 # Speed trap
                 speed_trap = ""
@@ -377,7 +396,17 @@ class LiveF1Engine:
             leaderboard = leaderboard[:22]
             leaderboard.sort(key=lambda x: x["position"])
 
-            meeting = self._session_info.get("Meeting", {})
+            track_msg = self._track_status.get("Message", "AllClear")
+            rc_msgs = list(self._race_control_messages)
+            if not rc_msgs:
+                flag_name = "GREEN" if track_msg in ("AllClear", "1") else ("RED" if track_msg in ("Red", "4") else track_msg.upper())
+                rc_msgs.append({
+                    "Utc": str(time.time()),
+                    "Category": "Flag",
+                    "Message": "TRACK CLEAR • GREEN FLAG" if flag_name == "GREEN" else f"TRACK STATUS • {flag_name}",
+                    "Flag": flag_name
+                })
+
             return {
                 "status": "live" if (time.time() - self._last_event_time < 300) else "completed",
                 "session_name": self._session_info.get("Name", "Practice 1"),
@@ -385,8 +414,8 @@ class LiveF1Engine:
                 "country_name": meeting.get("Country", {}).get("Name", "Grand Prix"),
                 "session_key": self._session_info.get("Key", 20260911),
                 "timestamp": time.time(),
-                "track_flag": self._track_status.get("Message", "AllClear"),
-                "race_control_messages": list(self._race_control_messages),
+                "track_flag": track_msg,
+                "race_control_messages": rc_msgs,
                 "leaderboard": leaderboard,
                 "engine": "livef1-signalr"
             }
