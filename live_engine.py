@@ -201,25 +201,37 @@ class LiveF1Engine:
                 target[k] = v
 
     def _get_driver_meta(self, num: int) -> Dict[str, str]:
-        num_str = str(num)
-        if num_str in self._driver_list:
-            raw = self._driver_list[num_str]
-            first = raw.get("FirstName", "")
-            last = raw.get("LastName", "")
-            broadcast = raw.get("BroadcastName") or f"{first[:1]}. {last}".strip()
-            return {
-                "broadcast_name": broadcast or f"Driver {num}",
-                "name_acronym": raw.get("Tla") or "DRV",
-                "team_name": raw.get("TeamName") or "F1 Team",
-                "team_colour": (raw.get("TeamColour") or "FFFFFF").replace("#", "")
-            }
-
         known = KNOWN_DRIVERS_2026.get(num, {})
+        num_str = str(num)
+        raw = self._driver_list.get(num_str, {})
+
+        first = str(raw.get("FirstName") or "").strip()
+        last = str(raw.get("LastName") or "").strip()
+        broadcast = str(raw.get("BroadcastName") or "").strip()
+
+        if not broadcast or broadcast in (".", f"Driver {num}"):
+            if first or last:
+                broadcast = f"{first[:1]}. {last}".strip()
+            else:
+                broadcast = known.get("broadcast_name", f"Driver {num}")
+
+        tla = str(raw.get("Tla") or "").strip()
+        if not tla or tla == "DRV":
+            tla = known.get("name_acronym", "DRV")
+
+        team_name = str(raw.get("TeamName") or "").strip()
+        if not team_name or team_name in ("F1 Team", "Team"):
+            team_name = known.get("team_name", "F1 Team")
+
+        team_colour = str(raw.get("TeamColour") or "").replace("#", "").strip()
+        if not team_colour or team_colour in ("FFFFFF", "000000"):
+            team_colour = known.get("team_colour", "FFFFFF").replace("#", "")
+
         return {
-            "broadcast_name": known.get("broadcast_name", f"Driver {num}"),
-            "name_acronym": known.get("name_acronym", "DRV"),
-            "team_name": known.get("team_name", "F1 Team"),
-            "team_colour": known.get("team_colour", "FFFFFF").replace("#", "")
+            "broadcast_name": broadcast or known.get("broadcast_name", f"Driver {num}"),
+            "name_acronym": tla or known.get("name_acronym", "DRV"),
+            "team_name": team_name or known.get("team_name", "F1 Team"),
+            "team_colour": team_colour or known.get("team_colour", "FFFFFF").replace("#", "")
         }
 
     async def get_live_timing(self) -> Dict[str, Any]:
@@ -319,7 +331,11 @@ class LiveF1Engine:
             ]
             next_pos = len(leaderboard) + 1
             for num in OFFICIAL_GRID_2026_NUMBERS:
+                if len(leaderboard) >= 22:
+                    break
                 if num not in present_numbers:
+                    if num == 6 and 22 in present_numbers:
+                        continue
                     meta = self._get_driver_meta(num)
                     leaderboard.append({
                         "position": next_pos,
@@ -341,6 +357,7 @@ class LiveF1Engine:
                     })
                     next_pos += 1
 
+            leaderboard = leaderboard[:22]
             leaderboard.sort(key=lambda x: x["position"])
 
             meeting = self._session_info.get("Meeting", {})
