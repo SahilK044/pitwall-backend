@@ -9,6 +9,7 @@ PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    engine.start()
     yield
     await engine.close()
 
