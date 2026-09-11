@@ -176,11 +176,28 @@ class LiveF1Engine:
                 elif topic == "WeatherData" and isinstance(payload, dict):
                     self._weather_data.update(payload)
 
-                elif topic == "RaceControlMessages" and isinstance(payload, dict):
-                    msgs = payload.get("Messages", [])
-                    if isinstance(msgs, list):
-                        self._race_control_messages.extend(msgs)
-                        self._race_control_messages = self._race_control_messages[-25:]
+                elif topic == "RaceControlMessages":
+                    msgs = []
+                    if isinstance(payload, dict):
+                        if "Messages" in payload:
+                            raw_msgs = payload["Messages"]
+                            if isinstance(raw_msgs, list):
+                                msgs = raw_msgs
+                            elif isinstance(raw_msgs, dict):
+                                msgs = list(raw_msgs.values())
+                        elif "Message" in payload or "Flag" in payload:
+                            msgs = [payload]
+                    elif isinstance(payload, list):
+                        msgs = payload
+
+                    if msgs:
+                        normalized = []
+                        for m in msgs:
+                            if isinstance(m, dict):
+                                normalized.append(m)
+                        if normalized:
+                            self._race_control_messages.extend(normalized)
+                            self._race_control_messages = self._race_control_messages[-50:]
 
                 elif topic == "TimingData" and isinstance(payload, dict):
                     lines = payload.get("Lines", {})
@@ -369,6 +386,7 @@ class LiveF1Engine:
                 "session_key": self._session_info.get("Key", 20260911),
                 "timestamp": time.time(),
                 "track_flag": self._track_status.get("Message", "AllClear"),
+                "race_control_messages": list(self._race_control_messages),
                 "leaderboard": leaderboard,
                 "engine": "livef1-signalr"
             }
