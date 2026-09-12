@@ -621,11 +621,16 @@ class LiveF1Engine:
                 })
 
             meeting = self._session_info.get("Meeting", {})
+            raw_circuit = meeting.get("Circuit", {}).get("ShortName") or meeting.get("Name")
+            raw_country = meeting.get("Country", {}).get("Name")
+            circuit_name = raw_circuit if raw_circuit and raw_circuit.lower() not in ("circuit", "unknown") else "Circuit de Barcelona-Catalunya"
+            country_name = raw_country if raw_country and raw_country.lower() not in ("grand prix", "unknown") else "Spain"
+
             return {
                 "status": "live" if (time.time() - self._last_event_time < 300) else "completed",
                 "session_name": self._session_info.get("Name", "Practice 1"),
-                "circuit_short_name": meeting.get("Circuit", {}).get("ShortName", "Circuit"),
-                "country_name": meeting.get("Country", {}).get("Name", "Grand Prix"),
+                "circuit_short_name": circuit_name,
+                "country_name": country_name,
                 "session_key": self._session_info.get("Key", 20260911),
                 "timestamp": time.time(),
                 "track_flag": track_msg,
