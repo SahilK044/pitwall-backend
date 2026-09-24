@@ -1,128 +1,186 @@
-import asyncio
+"""
+Pitwall live engine: F1's official live timing feed (livetiming.formula1.com, SignalR Core),
+authenticated with an F1 TV Pro token.
+
+Rules this module keeps:
+  * Every value served comes from the feed. Nothing is estimated, padded or defaulted:
+    a field the feed has not sent is null/empty.
+  * On connect the hub's Subscribe call returns a full snapshot of every topic; it is applied
+    first, then incremental "feed" updates are merged into it.
+  * CarData.z and Position.z (car telemetry and car coordinates) need the F1 TV Pro
+    entitlement. They arrive base64-encoded raw-deflate JSON.
+"""
+import base64
+import json
 import logging
 import os
-import re
 import threading
 import time
+import zlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
-from cachetools import TTLCache
+
 import httpx
 import requests
+from cachetools import TTLCache
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 
 logger = logging.getLogger("livef1_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-# Default F1 TV token provided by user (valid through Sept 15, 2026)
-DEFAULT_F1TV_TOKEN = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJFeHRlcm5hbEF1dGhvcml6YXRpb25zQ29udGV4dERhdGEiOiJJTkQiLCJTdWJzY3JpcHRpb25TdGF0dXMiOiJhY3RpdmUiLCJTdWJzY3JpYmVySWQiOiIyMjQ1MzI4ODIiLCJGaXJzdE5hbWUiOiJTYWhpbCIsImVudHMiOlt7ImNvdW50cnkiOiJJTkQiLCJlbnQiOiJSRUcifSx7ImNvdW50cnkiOiJJTkQiLCJlbnQiOiJQUkVNSVVNIn1dLCJMYXN0TmFtZSI6IktodXNybyIsImV4cCI6MTc4OTQ3MDE4MiwiU2Vzc2lvbklkIjoiZXlKaGJHY2lPaUpvZEhSd09pOHZkM2QzTG5jekxtOXlaeTh5TURBeEx6QTBMM2h0YkdSemFXY3RiVzl5WlNOb2JXRmpMWE5vWVRJMU5pSXNJblI1Y0NJNklrcFhWQ0o5LmV5SmlkU0k2SWpFd01ERXhJaXdpYzJraU9pSTJNR0U1WVdRNE5DMWxPVE5rTFRRNE1HWXRPREJrTmkxaFpqTTNORGswWmpKbE1qSWlMQ0pvZEhSd09pOHZjMk5vWlcxaGN5NTRiV3h6YjJGd0xtOXlaeTkzY3k4eU1EQTFMekExTDJsa1pXNTBhWFI1TDJOc1lXbHRjeTl1WVcxbGFXUmxiblJwWm1sbGNpSTZJakl5TkRVek1qZzRNaUlzSW1sa0lqb2lZVFkwWVRnNFkySXRPRFl6WmkwME1qY3hMVGxrWkdZdFltSXhPRFpsTXpGa01qaGpJaXdpZENJNklqRWlMQ0pzSWpvaVpXNHRSMElpTENKa1l5STZJak0yTkRRaUxDSmhaV1FpT2lJeU1ESTJMVEE1TFRJMVZERXhPakF6T2pBeUxqVXhNbG9pTENKa2RDSTZJakVpTENKbFpDSTZJakl3TWpZdE1UQXRNVEZVTVRFNk1ETTZNREl1TlRFeVdpSXNJbU5sWkNJNklqSXdNall0TURrdE1USlVNVEU2TURNNk1ESXVOVEV6V2lJc0ltbHdJam9pTWpRd01UbzBPVEF3T2pGak9EazZPRFZrT0RwbU9HSTJPbUk0TnpJNlpUSm1OVG8xWVRRaUxDSmpJam9pUjFWU1IwRlBUaUlzSW5OMElqb2lTRklpTENKd1l5STZJakV5TWpBd01TSXNJbU52SWpvaVNVNUVJaXdpYm1KbUlqb3hOemc1TVRJME5UZ3lMQ0psZUhBaU9qRTNPVEUzTVRZMU9ESXNJbWx6Y3lJNkltRnpZMlZ1Wkc5dUxuUjJJaXdpWVhWa0lqb2lZWE5qWlc1a2IyNHVkSFlpZlEuVzBaOUpCc3dvUWwyZVVGR0NVRHg1d3lyajNkc003ZE00SDdEWE5NUExLNCIsIlN1YnNjcmliZWRQcm9kdWN0IjoiRjEgVFYgUHJlbWl1bSBNb250aGx5IiwianRpIjoiMDI1YzVmMWUtYjc4Ni00N2QxLTk2MDgtMWI2NTdhNDZhYWZkIiwiaGFzaGVkU3Vic2NyaWJlcklkIjoiMmd2N2ljVnRNUmFSSXEvZDRCVHJaZkR2V2Q4bTdteE5MUGQ0bnp6SHI2Yz0iLCJTdWJzY3JpcHRpb24iOiJQUkVNSVVNIiwiaWF0IjoxNzg5MTI0NTgzLCJpc3MiOiJGMVRWIn0."
-    "GzX_pu6SgrddyIsaCEaFAfD8ozVUvamn_jfyW5TcWOc"
-)
-
-KNOWN_TEAM_COLOURS = {
-    "red bull racing": "3671C6",
-    "red bull": "3671C6",
-    "racing bulls": "6692FF",
-    "visa cash app rb": "6692FF",
-    "vcarb": "6692FF",
-    "rb": "6692FF",
-    "mclaren": "FF8000",
-    "ferrari": "E80020",
-    "mercedes": "00D2BE",
-    "aston martin": "229971",
-    "alpine": "0090FF",
-    "williams": "64C4FF",
-    "haas": "B6BABD",
-    "audi f1 team": "FF5A5A",
-    "audi": "FF5A5A",
-    "cadillac formula 1 team": "D4AF37",
-    "cadillac": "D4AF37",
-    "kick sauber": "52E252",
-    "sauber": "52E252",
-}
-
-def parse_lap_str(t: Any) -> float:
-    if not t:
-        return 999999.0
-    if isinstance(t, (int, float)):
-        return float(t)
-    if not isinstance(t, str):
-        return 999999.0
-    s = t.strip()
-    if not s or s in ("--", "NO TIME", "Standby", "LEADER", "POLE"):
-        return 999999.0
-    try:
-        parts = s.split(":")
-        if len(parts) == 2:
-            return float(parts[0]) * 60.0 + float(parts[1])
-        return float(parts[0])
-    except Exception:
-        return 999999.0
-
-# 2026 Grid Metadata (Norris #1 Champion, Verstappen #3, Audi F1 Team, Cadillac F1 Team)
-KNOWN_DRIVERS_2026 = {
-    1: {"broadcast_name": "L. NORRIS", "name_acronym": "NOR", "team_name": "McLaren", "team_colour": "FF8000"},
-    3: {"broadcast_name": "M. VERSTAPPEN", "name_acronym": "VER", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
-    5: {"broadcast_name": "G. BORTOLETO", "name_acronym": "BOR", "team_name": "Audi F1 Team", "team_colour": "FF5A5A"},
-    6: {"broadcast_name": "I. HADJAR", "name_acronym": "HAD", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
-    7: {"broadcast_name": "J. DOOHAN", "name_acronym": "DOO", "team_name": "Alpine", "team_colour": "0090FF"},
-    10: {"broadcast_name": "P. GASLY", "name_acronym": "GAS", "team_name": "Alpine", "team_colour": "0090FF"},
-    11: {"broadcast_name": "S. PEREZ", "name_acronym": "PER", "team_name": "Cadillac Formula 1 Team", "team_colour": "D4AF37"},
-    12: {"broadcast_name": "A. ANTONELLI", "name_acronym": "ANT", "team_name": "Mercedes", "team_colour": "00D2BE"},
-    14: {"broadcast_name": "F. ALONSO", "name_acronym": "ALO", "team_name": "Aston Martin", "team_colour": "229971"},
-    16: {"broadcast_name": "C. LECLERC", "name_acronym": "LEC", "team_name": "Ferrari", "team_colour": "E80020"},
-    18: {"broadcast_name": "L. STROLL", "name_acronym": "STR", "team_name": "Aston Martin", "team_colour": "229971"},
-    22: {"broadcast_name": "Y. TSUNODA", "name_acronym": "TSU", "team_name": "Racing Bulls", "team_colour": "6692FF"},
-    23: {"broadcast_name": "A. ALBON", "name_acronym": "ALB", "team_name": "Williams", "team_colour": "64C4FF"},
-    27: {"broadcast_name": "N. HULKENBERG", "name_acronym": "HUL", "team_name": "Audi F1 Team", "team_colour": "FF5A5A"},
-    30: {"broadcast_name": "L. LAWSON", "name_acronym": "LAW", "team_name": "Red Bull Racing", "team_colour": "3671C6"},
-    31: {"broadcast_name": "E. OCON", "name_acronym": "OCO", "team_name": "Haas", "team_colour": "B6BABD"},
-    41: {"broadcast_name": "A. LINDBLAD", "name_acronym": "LIN", "team_name": "Racing Bulls", "team_colour": "6692FF"},
-    43: {"broadcast_name": "F. COLAPINTO", "name_acronym": "COL", "team_name": "Alpine", "team_colour": "0090FF"},
-    44: {"broadcast_name": "L. HAMILTON", "name_acronym": "HAM", "team_name": "Ferrari", "team_colour": "E80020"},
-    55: {"broadcast_name": "C. SAINZ", "name_acronym": "SAI", "team_name": "Williams", "team_colour": "64C4FF"},
-    63: {"broadcast_name": "G. RUSSELL", "name_acronym": "RUS", "team_name": "Mercedes", "team_colour": "00D2BE"},
-    77: {"broadcast_name": "V. BOTTAS", "name_acronym": "BOT", "team_name": "Cadillac Formula 1 Team", "team_colour": "D4AF37"},
-    81: {"broadcast_name": "O. PIASTRI", "name_acronym": "PIA", "team_name": "McLaren", "team_colour": "FF8000"},
-    87: {"broadcast_name": "O. BEARMAN", "name_acronym": "BEA", "team_name": "Haas", "team_colour": "B6BABD"},
-}
-
+LIVETIMING_BASE = "https://livetiming.formula1.com"
 JOLPICA_BASE = "https://api.jolpi.ca/ergast/f1"
 meta_cache: TTLCache[str, Any] = TTLCache(maxsize=100, ttl=3600)
+
+TOPICS = [
+    "Heartbeat", "SessionInfo", "SessionStatus", "DriverList", "TimingData", "TimingAppData",
+    "TrackStatus", "WeatherData", "RaceControlMessages", "LapCount", "TeamRadio",
+    "PitLaneTimeCollection", "CarData.z", "Position.z",
+]
+
+# CarData channel ids in the F1 feed.
+CH_RPM, CH_SPEED, CH_GEAR, CH_THROTTLE, CH_BRAKE, CH_DRS = "0", "2", "3", "4", "5", "45"
+
+
+def load_f1tv_token() -> str:
+    """F1TV_TOKEN from the environment (the host's secret), else a git-ignored local .env file."""
+    token = os.environ.get("F1TV_TOKEN", "").strip()
+    if token:
+        return token
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("F1TV_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def token_expiry(token: str) -> Optional[datetime]:
+    """The JWT's exp claim, read without verifying the signature (it is only logged)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
+    except Exception:
+        return None
+
+
+def inflate(data: Any) -> Any:
+    """Decodes a .z topic payload: base64 of raw-deflate JSON."""
+    if not isinstance(data, str):
+        return data
+    try:
+        return json.loads(zlib.decompress(base64.b64decode(data), -zlib.MAX_WBITS))
+    except Exception as e:
+        logger.warning(f"Could not inflate compressed payload: {e}")
+        return None
+
+
+def merge(target: Any, source: Any) -> Any:
+    """
+    Merges a feed update into stored state. The feed sends lists in snapshots and
+    {"index": partial} dicts in updates; those patch the list in place instead of replacing it.
+    """
+    if isinstance(target, dict) and isinstance(source, dict):
+        for k, v in source.items():
+            if k == "_deleted" and isinstance(v, list):
+                for key in v:
+                    target.pop(str(key), None)
+                continue
+            target[k] = merge(target.get(k), v) if k in target else v
+        return target
+    if isinstance(target, list) and isinstance(source, dict):
+        for k, v in source.items():
+            try:
+                i = int(k)
+            except (TypeError, ValueError):
+                continue
+            while len(target) <= i:
+                target.append({})
+            target[i] = merge(target[i], v)
+        return target
+    return source
+
+
+def _value(obj: Any) -> str:
+    """A feed field that may be a bare value or {"Value": ...}."""
+    if isinstance(obj, dict):
+        obj = obj.get("Value")
+    return "" if obj is None else str(obj).strip()
+
+
+def _num(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_lap_str(t: Any) -> Optional[float]:
+    s = _value(t)
+    if not s:
+        return None
+    try:
+        parts = s.split(":")
+        return float(parts[0]) * 60.0 + float(parts[1]) if len(parts) == 2 else float(parts[0])
+    except Exception:
+        return None
+
+
+def _as_list(container: Any) -> List[Any]:
+    if isinstance(container, list):
+        return container
+    if isinstance(container, dict):
+        return [container[k] for k in sorted(container, key=lambda x: int(x) if str(x).isdigit() else 0)]
+    return []
 
 
 class LiveF1Engine:
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=10.0)
-        self._state_lock = threading.Lock()
-        
-        # State stores
-        self._session_info: Dict[str, Any] = {}
-        self._driver_list: Dict[str, Dict[str, Any]] = {}
-        self._timing_lines: Dict[str, Dict[str, Any]] = {}
-        self._weather_data: Dict[str, Any] = {}
-        self._track_status: Dict[str, Any] = {"Status": "1", "Message": "AllClear"}
-        self._race_control_messages: List[Dict[str, Any]] = []
-        self._driver_best_laps: Dict[int, str] = {}
+        self._lock = threading.Lock()
+        self._token = load_f1tv_token()
+        self._token_exp = token_expiry(self._token) if self._token else None
+        self._reset_state()
         self._last_event_time: float = 0.0
-        
-        # Thread & Connection
         self._hub_thread: Optional[threading.Thread] = None
         self._connection: Optional[Any] = None
-        self._is_connected: bool = False
-        self._stopped: bool = False
+        self._is_connected = False
+        self._stopped = False
+
+    def _reset_state(self):
+        self._session_info: Dict[str, Any] = {}
+        self._session_status: str = ""
+        self._drivers: Dict[str, Dict[str, Any]] = {}
+        self._timing: Dict[str, Any] = {}
+        self._timing_app: Dict[str, Any] = {}
+        self._weather: Dict[str, Any] = {}
+        self._track_status: Dict[str, Any] = {}
+        self._lap_count: Dict[str, Any] = {}
+        self._race_control: List[Dict[str, Any]] = []
+        self._radio: List[Dict[str, Any]] = []
+        self._pits: Dict[str, Dict[str, Any]] = {}
+        self._positions: Dict[str, Dict[str, Any]] = {}
+        self._car_data: Dict[str, Dict[str, Any]] = {}
+
+    # ---------------------------------------------------------------- connection
 
     def start(self):
-        """Starts the SignalR live timing background worker."""
         self._stopped = False
+        if not self._token:
+            # Timing, tyres, radio, race control and weather are public; only car positions and
+            # telemetry (CarData.z, Position.z) need an F1 TV Pro token.
+            logger.warning("F1TV_TOKEN is not set: connecting without it (no car positions or telemetry).")
+        if self._token_exp:
+            left = (self._token_exp - datetime.now(timezone.utc)).total_seconds() / 3600
+            logger.info(f"F1 TV token expires {self._token_exp.isoformat()} ({left:.1f} h left).")
         if self._hub_thread is None or not self._hub_thread.is_alive():
             self._hub_thread = threading.Thread(target=self._run_signalr, daemon=True, name="SignalR-Worker")
             self._hub_thread.start()
-            logger.info("SignalR background worker started.")
 
     def stop(self):
-        """Stops the SignalR worker gracefully."""
         self._stopped = True
         self._is_connected = False
         if self._connection:
@@ -130,578 +188,406 @@ class LiveF1Engine:
                 self._connection.stop()
             except Exception as e:
                 logger.warning(f"Error stopping connection: {e}")
-        logger.info("SignalR background worker stopped.")
+
+    def health(self) -> Dict[str, Any]:
+        return {
+            "connected": self._is_connected,
+            "token_set": bool(self._token),
+            "token_expires": self._token_exp.isoformat() if self._token_exp else None,
+            "token_expired": bool(self._token_exp and self._token_exp < datetime.now(timezone.utc)),
+            "last_event_age_s": round(time.time() - self._last_event_time, 1) if self._last_event_time else None,
+        }
 
     def _run_signalr(self):
-        token = os.environ.get("F1TV_TOKEN", DEFAULT_F1TV_TOKEN).strip()
-        if not token:
-            logger.error("No F1TV_TOKEN found. SignalR client cannot authenticate.")
-            return
-
-        negotiate_url = "https://livetiming.formula1.com/signalrcore/negotiate"
+        negotiate_url = f"{LIVETIMING_BASE}/signalrcore/negotiate"
         ws_url = "wss://livetiming.formula1.com/signalrcore"
-
         while not self._stopped:
             try:
                 headers = {}
                 try:
-                    r = requests.options(negotiate_url, headers=headers, timeout=6)
+                    r = requests.options(negotiate_url, timeout=6)
                     if "AWSALBCORS" in r.cookies:
                         headers["Cookie"] = f"AWSALBCORS={r.cookies['AWSALBCORS']}"
                 except Exception as ex:
-                    logger.warning(f"Pre-negotiate cookie fetch notice: {ex}")
+                    logger.warning(f"Pre-negotiate cookie fetch failed: {ex}")
 
-                options = {
-                    "verify_ssl": True,
-                    "access_token_factory": lambda: token,
-                    "headers": headers
-                }
-
+                token = self._token
+                options = {"verify_ssl": True, "headers": headers}
+                if token:
+                    options["access_token_factory"] = lambda: token
                 conn = HubConnectionBuilder() \
                     .with_url(ws_url, options=options) \
                     .configure_logging(logging.WARNING) \
                     .build()
 
                 def on_open():
-                    logger.info(">>> F1 Live Timing SignalR Connection Established!")
+                    logger.info("F1 live timing connected; subscribing.")
                     self._is_connected = True
-                    topics = [
-                        "Heartbeat", "SessionInfo", "DriverList", "TimingData",
-                        "TimingAppData", "TrackStatus", "WeatherData", "RaceControlMessages"
-                    ]
-                    conn.send("Subscribe", [topics])
-                    logger.info(f"Subscribed to F1 topics: {topics}")
+                    conn.send("Subscribe", [TOPICS], on_invocation=self._on_snapshot)
 
                 def on_close():
-                    logger.info("F1 Live Timing SignalR Connection Closed.")
+                    logger.info("F1 live timing connection closed.")
                     self._is_connected = False
 
                 conn.on_open(on_open)
                 conn.on_close(on_close)
-                conn.on("feed", self._handle_feed)
-
+                conn.on("feed", self._on_feed)
                 self._connection = conn
                 conn.start()
-
-                # Keep thread alive as long as connected
+                # start() returns before on_open fires: wait for the handshake, then hold.
+                deadline = time.time() + 20
+                while not self._is_connected and not self._stopped and time.time() < deadline:
+                    time.sleep(0.5)
                 while self._is_connected and not self._stopped:
                     time.sleep(2)
-
+                try:
+                    conn.stop()
+                except Exception:
+                    pass
             except Exception as e:
-                logger.error(f"SignalR connection loop error: {e}")
+                logger.error(f"SignalR loop error: {e}")
                 self._is_connected = False
-
             if not self._stopped:
-                logger.info("Reconnecting to F1 Live Timing in 5 seconds...")
                 time.sleep(5)
 
-    def _handle_feed(self, data):
-        try:
-            if not isinstance(data, list) or len(data) < 2:
-                return
-            topic = data[0]
-            payload = data[1]
+    def _on_snapshot(self, message: Any):
+        """The Subscribe call's result: the current state of every topic."""
+        msgs = message if isinstance(message, list) else [message]
+        for m in msgs:
+            result = getattr(m, "result", None)
+            if not isinstance(result, dict):
+                continue
+            with self._lock:
+                # SessionInfo first so a session change resets before the rest lands.
+                if "SessionInfo" in result:
+                    self._apply("SessionInfo", result["SessionInfo"], snapshot=True)
+                for topic, data in result.items():
+                    if topic != "SessionInfo":
+                        self._apply(topic, data, snapshot=True)
             self._last_event_time = time.time()
+            logger.info(f"Snapshot applied: {sorted(result.keys())}")
 
-            with self._state_lock:
-                if topic == "SessionInfo" and isinstance(payload, dict):
-                    self._session_info.update(payload)
+    def _on_feed(self, data: Any):
+        if not isinstance(data, list) or len(data) < 2:
+            return
+        self._last_event_time = time.time()
+        with self._lock:
+            try:
+                self._apply(data[0], data[1], snapshot=False)
+            except Exception as e:
+                logger.warning(f"Error applying {data[0]}: {e}")
 
-                elif topic == "DriverList":
-                    drivers_data = []
-                    if isinstance(payload, dict):
-                        if "Drivers" in payload and isinstance(payload["Drivers"], dict):
-                            drivers_data = list(payload["Drivers"].items())
-                        elif "Drivers" in payload and isinstance(payload["Drivers"], list):
-                            drivers_data = [(str(d.get("RacingNumber", "")), d) for d in payload["Drivers"] if isinstance(d, dict)]
-                        else:
-                            drivers_data = list(payload.items())
-                    elif isinstance(payload, list):
-                        drivers_data = [(str(d.get("RacingNumber", "")), d) for d in payload if isinstance(d, dict)]
+    # ---------------------------------------------------------------- topic handlers
 
-                    for num_str, d_info in drivers_data:
-                        if isinstance(d_info, dict) and num_str:
-                            self._driver_list.setdefault(str(num_str), {}).update(d_info)
-                            try:
-                                clean_key = str(int(num_str))
-                                self._driver_list.setdefault(clean_key, {}).update(d_info)
-                            except ValueError:
-                                pass
+    def _apply(self, topic: str, payload: Any, snapshot: bool):
+        if topic.endswith(".z"):
+            payload = inflate(payload)
+            topic = topic[:-2]
+        if payload is None:
+            return
 
-                elif topic == "TrackStatus" and isinstance(payload, dict):
-                    self._track_status.update(payload)
+        if topic == "SessionInfo" and isinstance(payload, dict):
+            new_key = payload.get("Key")
+            if new_key is not None and self._session_info.get("Key") not in (None, new_key):
+                logger.info(f"Session changed to {payload.get('Name')}: clearing state.")
+                self._reset_state()
+            merge(self._session_info, payload)
+        elif topic == "SessionStatus" and isinstance(payload, dict):
+            self._session_status = str(payload.get("Status") or self._session_status)
+        elif topic == "DriverList" and isinstance(payload, dict):
+            for num, info in payload.items():
+                if str(num).isdigit() and isinstance(info, dict):
+                    merge(self._drivers.setdefault(str(int(num)), {}), info)
+        elif topic == "TimingData" and isinstance(payload, dict):
+            merge(self._timing, payload)
+        elif topic == "TimingAppData" and isinstance(payload, dict):
+            merge(self._timing_app, payload)
+        elif topic == "TrackStatus" and isinstance(payload, dict):
+            merge(self._track_status, payload)
+        elif topic == "WeatherData" and isinstance(payload, dict):
+            merge(self._weather, payload)
+        elif topic == "LapCount" and isinstance(payload, dict):
+            merge(self._lap_count, payload)
+        elif topic == "RaceControlMessages" and isinstance(payload, dict):
+            seen = {(m.get("Utc"), m.get("Message")) for m in self._race_control}
+            for m in _as_list(payload.get("Messages")):
+                if isinstance(m, dict) and (m.get("Utc"), m.get("Message")) not in seen:
+                    self._race_control.append(m)
+                    seen.add((m.get("Utc"), m.get("Message")))
+            self._race_control = self._race_control[-300:]
+        elif topic == "TeamRadio" and isinstance(payload, dict):
+            seen = {c.get("Path") for c in self._radio}
+            for c in _as_list(payload.get("Captures")):
+                if isinstance(c, dict) and c.get("Path") and c.get("Path") not in seen:
+                    self._radio.append(c)
+                    seen.add(c.get("Path"))
+            self._radio = self._radio[-200:]
+        elif topic == "PitLaneTimeCollection" and isinstance(payload, dict):
+            for num, pit in (payload.get("PitTimes") or {}).items():
+                if not isinstance(pit, dict) or not str(num).isdigit():
+                    continue
+                lap = str(pit.get("Lap") or "")
+                self._pits[f"{int(num)}:{lap}"] = {**pit, "RacingNumber": str(int(num)), "_seen": time.time()}
+        elif topic == "Position" and isinstance(payload, dict):
+            for frame in payload.get("Position") or []:
+                ts = frame.get("Timestamp")
+                for num, e in (frame.get("Entries") or {}).items():
+                    if isinstance(e, dict) and str(num).isdigit():
+                        self._positions[str(int(num))] = {**e, "Timestamp": ts}
+        elif topic == "CarData" and isinstance(payload, dict):
+            for entry in payload.get("Entries") or []:
+                utc = entry.get("Utc")
+                for num, car in (entry.get("Cars") or {}).items():
+                    ch = (car or {}).get("Channels") or {}
+                    if str(num).isdigit():
+                        self._car_data[str(int(num))] = {**{k: ch.get(k) for k in ch}, "Utc": utc}
 
-                elif topic == "WeatherData" and isinstance(payload, dict):
-                    self._weather_data.update(payload)
+    # ---------------------------------------------------------------- read models
 
-                elif topic == "RaceControlMessages":
-                    msgs = []
-                    if isinstance(payload, dict):
-                        if "Messages" in payload:
-                            raw_msgs = payload["Messages"]
-                            if isinstance(raw_msgs, list):
-                                msgs = raw_msgs
-                            elif isinstance(raw_msgs, dict):
-                                msgs = list(raw_msgs.values())
-                        elif "Message" in payload or "Flag" in payload:
-                            msgs = [payload]
-                    elif isinstance(payload, list):
-                        msgs = payload
+    def _session_utc(self, field: str) -> Optional[str]:
+        """SessionInfo StartDate/EndDate are circuit-local; GmtOffset turns them into UTC."""
+        local = self._session_info.get(field)
+        offset = str(self._session_info.get("GmtOffset") or "")
+        if not local or not offset:
+            return None
+        try:
+            sign = -1 if offset.startswith("-") else 1
+            h, m, *_ = [int(x) for x in offset.lstrip("+-").split(":")]
+            dt = datetime.fromisoformat(str(local)[:19]) - sign * timedelta(hours=h, minutes=m)
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        except Exception:
+            return None
 
-                    if msgs:
-                        normalized = []
-                        for m in msgs:
-                            if isinstance(m, dict):
-                                normalized.append(m)
-                        if normalized:
-                            self._race_control_messages.extend(normalized)
-                            self._race_control_messages = self._race_control_messages[-50:]
+    def _session_part(self) -> Optional[int]:
+        part = self._timing.get("SessionPart")
+        try:
+            return int(part) if part is not None else None
+        except (TypeError, ValueError):
+            return None
 
-                elif topic == "TimingData" and isinstance(payload, dict):
-                    lines = payload.get("Lines", {})
-                    if isinstance(lines, dict):
-                        for num_str, line_data in lines.items():
-                            if num_str not in self._timing_lines:
-                                self._timing_lines[num_str] = {}
-                            self._deep_update(self._timing_lines[num_str], line_data)
-
-        except Exception as e:
-            logger.warning(f"Error handling feed message: {e}")
-
-    def _deep_update(self, target: dict, source: dict):
-        for k, v in source.items():
-            if isinstance(v, dict) and k in target and isinstance(target[k], dict):
-                self._deep_update(target[k], v)
-            else:
-                target[k] = v
-
-    def _get_driver_meta(self, num: int, line: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-        known = KNOWN_DRIVERS_2026.get(num, {})
-        num_str = str(num)
-        raw = self._driver_list.get(num_str, {})
-        if not raw and str(int(num)) in self._driver_list:
-            raw = self._driver_list[str(int(num))]
-
-        first = str(raw.get("FirstName") or "").strip()
-        last = str(raw.get("LastName") or "").strip()
-        broadcast = str(raw.get("BroadcastName") or "").strip()
-
-        if not broadcast or broadcast in (".", f"Driver {num}"):
-            if first or last:
-                broadcast = f"{first[:1]}. {last}".strip()
-            else:
-                broadcast = known.get("broadcast_name", f"Driver {num}")
-
-        tla = str(raw.get("Tla") or "").strip()
-        if not tla or tla == "DRV":
-            tla = known.get("name_acronym", "DRV")
-
-        # Live feed team ALWAYS takes priority over hardcoded dictionary!
-        team_name = str(raw.get("TeamName") or "").strip()
-        if not team_name and line:
-            team_name = str(line.get("TeamName") or line.get("Team") or "").strip()
-        if not team_name or team_name in ("F1 Team", "Team", "Formula 1"):
-            team_name = known.get("team_name", "F1 Team")
-
-        # Live feed team colour with fallback to dynamic team lookup
-        team_colour = str(raw.get("TeamColour") or "").replace("#", "").strip()
-        if not team_colour and line:
-            team_colour = str(line.get("TeamColour") or "").replace("#", "").strip()
-        if not team_colour or team_colour.upper() in ("FFFFFF", "000000"):
-            norm_team = team_name.lower().strip()
-            for k, col in KNOWN_TEAM_COLOURS.items():
-                if k in norm_team:
-                    team_colour = col
-                    break
-            if not team_colour:
-                team_colour = known.get("team_colour", "FFFFFF").replace("#", "")
-
+    def _driver_meta(self, num: str) -> Dict[str, Any]:
+        d = self._drivers.get(num, {})
+        colour = str(d.get("TeamColour") or "").replace("#", "").strip()
         return {
-            "broadcast_name": broadcast or known.get("broadcast_name", f"Driver {num}"),
-            "name_acronym": tla or known.get("name_acronym", "DRV"),
-            "team_name": team_name or known.get("team_name", "F1 Team"),
-            "team_colour": team_colour or known.get("team_colour", "FFFFFF").replace("#", "")
+            "broadcast_name": d.get("BroadcastName") or d.get("FullName") or None,
+            "full_name": d.get("FullName") or None,
+            "name_acronym": d.get("Tla") or None,
+            "team_name": d.get("TeamName") or None,
+            "team_colour": colour or None,
+            "headshot_url": d.get("HeadshotUrl") or None,
         }
 
+    def _stints(self, num: str) -> List[Dict[str, Any]]:
+        line = (self._timing_app.get("Lines") or {}).get(num) or {}
+        out = []
+        for i, s in enumerate(_as_list(line.get("Stints"))):
+            if not isinstance(s, dict) or not s.get("Compound"):
+                continue
+            out.append({
+                "stint_number": i + 1,
+                "compound": str(s.get("Compound")).upper(),
+                "new": str(s.get("New")).lower() == "true" if s.get("New") is not None else None,
+                "tyre_age_at_start": int(s["StartLaps"]) if str(s.get("StartLaps", "")).isdigit() else None,
+                "tyre_age": int(s["TotalLaps"]) if str(s.get("TotalLaps", "")).isdigit() else None,
+            })
+        return out
+
+    def _race_control_out(self) -> List[Dict[str, Any]]:
+        out = []
+        for m in self._race_control:
+            num = m.get("RacingNumber")
+            out.append({
+                "date": m.get("Utc"),
+                "lap_number": int(m["Lap"]) if str(m.get("Lap", "")).isdigit() else None,
+                "category": m.get("Category"),
+                "flag": m.get("Flag"),
+                "scope": m.get("Scope"),
+                "sector": m.get("Sector"),
+                "message": m.get("Message"),
+                "driver_number": int(num) if str(num or "").isdigit() else None,
+            })
+        return out
+
+    def _leaderboard(self) -> List[Dict[str, Any]]:
+        lines = self._timing.get("Lines") or {}
+        part = self._session_part()
+        board = []
+        for num, line in lines.items():
+            if not str(num).isdigit() or not isinstance(line, dict):
+                continue
+            num = str(int(num))
+            meta = self._driver_meta(num)
+
+            best = _value(line.get("BestLapTime"))
+            gap = _value(line.get("GapToLeader")) or _value(line.get("TimeDiffToFastest"))
+            interval = _value(line.get("IntervalToPositionAhead")) or _value(line.get("TimeDiffToPositionAhead"))
+            # Qualifying: best lap and gaps are kept per segment.
+            if part:
+                seg_best = _as_list(line.get("BestLapTimes"))
+                if len(seg_best) >= part and _value(seg_best[part - 1]):
+                    best = _value(seg_best[part - 1])
+                stats = _as_list(line.get("Stats"))
+                if len(stats) >= part and isinstance(stats[part - 1], dict):
+                    gap = _value(stats[part - 1].get("TimeDiffToFastest")) or gap
+                    interval = _value(stats[part - 1].get("TimeDifftoPositionAhead")) or interval
+
+            sectors = _as_list(line.get("Sectors"))
+
+            def sector(i: int):
+                s = sectors[i] if len(sectors) > i and isinstance(sectors[i], dict) else {}
+                v = _value(s.get("Value"))
+                state = "NONE"
+                if v:
+                    state = "SESSION_BEST" if s.get("OverallFastest") else "PERSONAL_BEST" if s.get("PersonalFastest") else "SLOWER"
+                return v, state
+
+            (s1, st1), (s2, st2), (s3, st3) = sector(0), sector(1), sector(2)
+            speeds = line.get("Speeds") or {}
+            pos = line.get("Position")
+            board.append({
+                "position": int(pos) if str(pos or "").isdigit() else None,
+                "driver_number": int(num),
+                **meta,
+                "last_lap_time": _value(line.get("LastLapTime")),
+                "best_lap_time": best,
+                "gap_to_leader": gap,
+                "interval": interval,
+                "sector1": s1, "sector2": s2, "sector3": s3,
+                "sector1_state": st1, "sector2_state": st2, "sector3_state": st3,
+                "speed_trap": _value(speeds.get("ST")) if isinstance(speeds, dict) else "",
+                "laps": line.get("NumberOfLaps"),
+                "in_pit": bool(line.get("InPit")),
+                "pit_out": bool(line.get("PitOut")),
+                "number_of_pit_stops": line.get("NumberOfPitStops"),
+                "is_retired": bool(line.get("Retired")),
+                "is_stopped": bool(line.get("Stopped")),
+                "knocked_out": bool(line.get("KnockedOut")),
+                # The feed has no crash flag; stopped cars are reported as stopped.
+                "is_crashed": False,
+                "stints": self._stints(num),
+            })
+        board.sort(key=lambda d: (d["position"] is None, d["position"] or 0, d["driver_number"]))
+        return board
+
+    def _positions_out(self) -> List[Dict[str, Any]]:
+        out = []
+        for num, p in self._positions.items():
+            if p.get("X") is None or p.get("Y") is None:
+                continue
+            out.append({
+                "driver_number": int(num), "date": p.get("Timestamp"), "status": p.get("Status"),
+                "x": _num(p.get("X")), "y": _num(p.get("Y")), "z": _num(p.get("Z")),
+            })
+        return out
+
+    def _car_data_out(self) -> List[Dict[str, Any]]:
+        out = []
+        for num, c in self._car_data.items():
+            brake = _num(c.get(CH_BRAKE))
+            out.append({
+                "driver_number": int(num), "date": c.get("Utc"),
+                "rpm": int(c[CH_RPM]) if c.get(CH_RPM) is not None else None,
+                "speed": int(c[CH_SPEED]) if c.get(CH_SPEED) is not None else None,
+                "n_gear": int(c[CH_GEAR]) if c.get(CH_GEAR) is not None else None,
+                "throttle": int(c[CH_THROTTLE]) if c.get(CH_THROTTLE) is not None else None,
+                # The feed sends brake as on/off (0 or 1, sometimes 100); served as 0 or 100.
+                "brake": None if brake is None else (100 if brake > 0 else 0),
+                "drs": int(c[CH_DRS]) if c.get(CH_DRS) is not None else None,
+            })
+        return out
+
+    def _status(self) -> str:
+        if not self._timing.get("Lines"):
+            return "idle"
+        recent = time.time() - self._last_event_time < 300
+        finished = self._session_status in ("Finished", "Finalised", "Ends")
+        return "live" if recent and not finished else "completed"
+
     async def get_live_timing(self) -> Dict[str, Any]:
-        """Returns the active live session timing, positions, and interval gaps."""
-        with self._state_lock:
-            leaderboard = []
-            session_name = self._session_info.get("Name", "Practice 1")
-            session_name_lower = session_name.lower()
-            is_time_trial = any(w in session_name_lower for w in ("practice", "fp", "qualifying", "shootout"))
-
-            for num_str, line in self._timing_lines.items():
-                try:
-                    num = int(num_str)
-                except ValueError:
-                    continue
-
-                pos_raw = line.get("Position")
-                try:
-                    pos = int(pos_raw) if pos_raw is not None else 99
-                except (ValueError, TypeError):
-                    pos = 99
-
-                meta = self._get_driver_meta(num, line=line)
-
-                # Lap times
-                last_lap = ""
-                last_obj = line.get("LastLapTime")
-                if isinstance(last_obj, dict):
-                    last_lap = last_obj.get("Value", "")
-                elif isinstance(last_obj, str):
-                    last_lap = last_obj
-
-                best_lap = ""
-                best_obj = line.get("BestLapTime")
-                if isinstance(best_obj, dict):
-                    best_lap = best_obj.get("Value", "")
-                elif isinstance(best_obj, str):
-                    best_lap = best_obj
-
-                # Update driver best lap memory across session
-                fastest_for_driver = self._driver_best_laps.get(num, "")
-                for cand in (best_lap, last_lap):
-                    if cand and parse_lap_str(cand) < parse_lap_str(fastest_for_driver):
-                        fastest_for_driver = cand
-                if fastest_for_driver:
-                    self._driver_best_laps[num] = fastest_for_driver
-                    best_lap = fastest_for_driver
-
-                # Sectors & Sector states (OverallFastest = SESSION_BEST, PersonalFastest = PERSONAL_BEST, Slower)
-                sectors = line.get("Sectors", {})
-                s1, s1_state = "", "NONE"
-                s2, s2_state = "", "NONE"
-                s3, s3_state = "", "NONE"
-
-                def _parse_sector(sec_item):
-                    if isinstance(sec_item, dict):
-                        val = sec_item.get("Value") or sec_item.get("PreviousValue") or ""
-                        val_str = str(val).strip()
-                        state = "NONE"
-                        if sec_item.get("OverallFastest") is True:
-                            state = "SESSION_BEST"
-                        elif sec_item.get("PersonalFastest") is True:
-                            state = "PERSONAL_BEST"
-                        elif val_str and val_str != "--":
-                            state = "SLOWER"
-                        return val_str, state
-                    elif isinstance(sec_item, str):
-                        s = sec_item.strip()
-                        return s, ("SLOWER" if s and s != "--" else "NONE")
-                    return "", "NONE"
-
-                if isinstance(sectors, dict):
-                    s1, s1_state = _parse_sector(sectors.get(0) or sectors.get("0") or {})
-                    s2, s2_state = _parse_sector(sectors.get(1) or sectors.get("1") or {})
-                    s3, s3_state = _parse_sector(sectors.get(2) or sectors.get("2") or {})
-                elif isinstance(sectors, (list, tuple)):
-                    if len(sectors) > 0: s1, s1_state = _parse_sector(sectors[0])
-                    if len(sectors) > 1: s2, s2_state = _parse_sector(sectors[1])
-                    if len(sectors) > 2: s3, s3_state = _parse_sector(sectors[2])
-
-                # Speed trap
-                speed_trap = ""
-                speeds = line.get("Speeds", {})
-                if isinstance(speeds, dict):
-                    st_obj = speeds.get("ST", {})
-                    if isinstance(st_obj, dict):
-                        speed_trap = str(st_obj.get("Value", ""))
-
-                # Gaps
-                gap_val = line.get("GapToLeader", "")
-                if isinstance(gap_val, dict):
-                    gap_val = gap_val.get("Value", "")
-
-                int_val = line.get("IntervalToPositionAhead", "")
-                if isinstance(int_val, dict):
-                    int_val = int_val.get("Value", "")
-
-                laps = line.get("NumberOfLaps", 0)
-                in_pit = bool(line.get("InPit", False))
-                stopped = bool(line.get("Stopped", False))
-                retired = bool(line.get("Retired", False))
-                knocked_out = bool(line.get("KnockedOut", False))
-                is_crashed = stopped or bool(line.get("Crash", False))
-                is_retired = retired or knocked_out
-
-                leaderboard.append({
-                    "position": pos,
-                    "driver_number": num,
-                    "broadcast_name": meta["broadcast_name"],
-                    "name_acronym": meta["name_acronym"],
-                    "team_name": meta["team_name"],
-                    "team_colour": meta["team_colour"],
-                    "last_lap_time": last_lap,
-                    "best_lap_time": best_lap,
-                    "gap_to_leader": str(gap_val) if gap_val else ("LEADER" if pos == 1 else "--"),
-                    "interval": str(int_val) if int_val else ("LEADER" if pos == 1 else "--"),
-                    "sector1": str(s1),
-                    "sector2": str(s2),
-                    "sector3": str(s3),
-                    "sector1_state": s1_state,
-                    "sector2_state": s2_state,
-                    "sector3_state": s3_state,
-                    "speed_trap": speed_trap,
-                    "laps": laps,
-                    "in_pit": in_pit,
-                    "is_crashed": is_crashed,
-                    "is_retired": is_retired,
-                    "is_stopped": stopped
-                })
-
-            present_numbers = {int(k) for k in self._timing_lines.keys() if k.isdigit()}
-            # Guarantee the full 22-car 2026 grid is represented (in-pit cars with no laps set)
-            OFFICIAL_GRID_2026_NUMBERS = [
-                1, 81,       # McLaren (Norris, Piastri)
-                16, 44,      # Ferrari (Leclerc, Hamilton)
-                63, 12,      # Mercedes (Russell, Antonelli)
-                3, 30,       # Red Bull (Verstappen, Lawson)
-                22, 41,      # Racing Bulls (Tsunoda, Lindblad)
-                23, 55,      # Williams (Albon, Sainz)
-                14, 18,      # Aston Martin (Alonso, Stroll)
-                10, 43,      # Alpine (Gasly, Colapinto)
-                31, 87,      # Haas (Ocon, Bearman)
-                27, 5,       # Audi F1 Team (Hulkenberg, Bortoleto)
-                11, 77,      # Cadillac Formula 1 Team (Perez, Bottas)
-                6            # Reserve (Hadjar)
-            ]
-            next_pos = len(leaderboard) + 1
-            for num in OFFICIAL_GRID_2026_NUMBERS:
-                if len(leaderboard) >= 22:
-                    break
-                if num not in present_numbers:
-                    if num == 6 and (22 in present_numbers or 30 in present_numbers):
-                        continue
-                    meta = self._get_driver_meta(num)
-                    leaderboard.append({
-                        "position": next_pos,
-                        "driver_number": num,
-                        "broadcast_name": meta["broadcast_name"],
-                        "name_acronym": meta["name_acronym"],
-                        "team_name": meta["team_name"],
-                        "team_colour": meta["team_colour"],
-                        "last_lap_time": "",
-                        "best_lap_time": "",
-                        "gap_to_leader": "NO TIME",
-                        "interval": "--",
-                        "sector1": "",
-                        "sector2": "",
-                        "sector3": "",
-                        "sector1_state": "NONE",
-                        "sector2_state": "NONE",
-                        "sector3_state": "NONE",
-                        "speed_trap": "",
-                        "laps": 0,
-                        "in_pit": True,
-                        "is_crashed": False,
-                        "is_retired": False,
-                        "is_stopped": False
-                    })
-                    next_pos += 1
-
-            # Cross-reference Race Control Messages for crashes / stoppages
-            rc_lower = [str(m.get("Message") or "").lower() for m in self._race_control_messages]
-            for d in leaderboard:
-                car_num = d["driver_number"]
-                tla = d["name_acronym"].lower()
-                pattern = re.compile(rf"(?:\bcar\s*{car_num}\b|\b{car_num}\b|\({re.escape(tla)}\))")
-                for rc_text in rc_lower:
-                    if pattern.search(rc_text):
-                        if any(w in rc_text for w in ("crash", "stopped", "off track", "stranded", "accident", "barrier")):
-                            d["is_crashed"] = True
-                            d["is_stopped"] = True
-                        elif any(w in rc_text for w in ("retired", "technical issue", "mechanical failure", "out of session")):
-                            d["is_retired"] = True
-
-            # Compute session-wide fastest sectors across the leaderboard
-            def _sec_to_float(v):
-                if not v or v == "--": return None
-                try:
-                    return float(str(v).replace("+", "").strip())
-                except (ValueError, TypeError):
-                    return None
-
-            s1_vals = [s for s in (_sec_to_float(d.get("sector1")) for d in leaderboard) if s is not None and s > 10.0]
-            min_s1 = min(s1_vals) if s1_vals else None
-
-            s2_vals = [s for s in (_sec_to_float(d.get("sector2")) for d in leaderboard) if s is not None and s > 10.0]
-            min_s2 = min(s2_vals) if s2_vals else None
-
-            s3_vals = [s for s in (_sec_to_float(d.get("sector3")) for d in leaderboard) if s is not None and s > 10.0]
-            min_s3 = min(s3_vals) if s3_vals else None
-
-            for d in leaderboard:
-                # Sector 1
-                s1_f = _sec_to_float(d.get("sector1"))
-                if s1_f is not None:
-                    if min_s1 is not None and abs(s1_f - min_s1) < 0.005:
-                        d["sector1_state"] = "SESSION_BEST"
-                    elif d.get("sector1_state") != "SESSION_BEST":
-                        if (min_s1 is not None and (s1_f - min_s1) <= 0.35) or d.get("position", 99) <= 5:
-                            d["sector1_state"] = "PERSONAL_BEST"
-                        else:
-                            d["sector1_state"] = "SLOWER"
-                else:
-                    d["sector1_state"] = "NONE"
-
-                # Sector 2
-                s2_f = _sec_to_float(d.get("sector2"))
-                if s2_f is not None:
-                    if min_s2 is not None and abs(s2_f - min_s2) < 0.005:
-                        d["sector2_state"] = "SESSION_BEST"
-                    elif d.get("sector2_state") != "SESSION_BEST":
-                        if (min_s2 is not None and (s2_f - min_s2) <= 0.35) or d.get("position", 99) <= 5:
-                            d["sector2_state"] = "PERSONAL_BEST"
-                        else:
-                            d["sector2_state"] = "SLOWER"
-                else:
-                    d["sector2_state"] = "NONE"
-
-                # Sector 3
-                s3_f = _sec_to_float(d.get("sector3"))
-                if s3_f is not None:
-                    if min_s3 is not None and abs(s3_f - min_s3) < 0.005:
-                        d["sector3_state"] = "SESSION_BEST"
-                    elif d.get("sector3_state") != "SESSION_BEST":
-                        if (min_s3 is not None and (s3_f - min_s3) <= 0.35) or d.get("position", 99) <= 5:
-                            d["sector3_state"] = "PERSONAL_BEST"
-                        else:
-                            d["sector3_state"] = "SLOWER"
-                else:
-                    d["sector3_state"] = "NONE"
-
-            # In Practice & Qualifying: rank strictly by fastest lap time!
-            if is_time_trial:
-                def _sort_key(d):
-                    t = parse_lap_str(d.get("best_lap_time") or d.get("last_lap_time") or "")
-                    if t < 999999.0:
-                        return (0, t, d.get("driver_number", 99))
-                    return (1, -d.get("laps", 0), d.get("driver_number", 99))
-
-                leaderboard.sort(key=_sort_key)
-                leaderboard = leaderboard[:22]
-
-                leader_sec = None
-                prev_sec = None
-                for idx, d in enumerate(leaderboard):
-                    d["position"] = idx + 1
-                    t = parse_lap_str(d.get("best_lap_time") or d.get("last_lap_time") or "")
-                    if idx == 0:
-                        if t < 999999.0:
-                            leader_sec = t
-                            prev_sec = t
-                            d["gap_to_leader"] = "POLE" if "qualifying" in session_name_lower else "LEADER"
-                            d["interval"] = "—"
-                        else:
-                            d["gap_to_leader"] = "NO TIME"
-                            d["interval"] = "--"
-                    else:
-                        if t < 999999.0 and leader_sec is not None:
-                            d["gap_to_leader"] = f"+{t - leader_sec:.3f}"
-                            d["interval"] = f"+{t - prev_sec:.3f}" if prev_sec is not None else f"+{t - leader_sec:.3f}"
-                            prev_sec = t
-                        else:
-                            d["gap_to_leader"] = "NO TIME"
-                            d["interval"] = "--"
-            else:
-                leaderboard.sort(key=lambda x: x["position"])
-                leaderboard = leaderboard[:22]
-
-            track_msg = self._track_status.get("Message", "AllClear")
-            rc_msgs = list(self._race_control_messages)
-            if not rc_msgs:
-                flag_name = "GREEN" if track_msg in ("AllClear", "1") else ("RED" if track_msg in ("Red", "4") else track_msg.upper())
-                rc_msgs.append({
-                    "Utc": str(time.time()),
-                    "Category": "Flag",
-                    "Message": "TRACK CLEAR • GREEN FLAG" if flag_name == "GREEN" else f"TRACK STATUS • {flag_name}",
-                    "Flag": flag_name
-                })
-
-            meeting = self._session_info.get("Meeting", {})
-            raw_circuit = meeting.get("Circuit", {}).get("ShortName") or meeting.get("Name")
-            raw_country = meeting.get("Country", {}).get("Name")
-            circuit_name = raw_circuit if raw_circuit and raw_circuit.lower() not in ("circuit", "unknown") else "Circuit de Barcelona-Catalunya"
-            country_name = raw_country if raw_country and raw_country.lower() not in ("grand prix", "unknown") else "Spain"
-
+        with self._lock:
+            meeting = self._session_info.get("Meeting") or {}
+            path = self._session_info.get("Path") or ""
+            radio = [{
+                "driver_number": int(c["RacingNumber"]) if str(c.get("RacingNumber", "")).isdigit() else None,
+                "date": c.get("Utc"),
+                "recording_url": f"{LIVETIMING_BASE}/static/{path}{c['Path']}" if path else None,
+            } for c in self._radio]
+            pits = [{
+                "driver_number": int(p["RacingNumber"]),
+                "lap_number": int(p["Lap"]) if str(p.get("Lap", "")).isdigit() else None,
+                "pit_duration": _num(p.get("Duration")),
+            } for p in sorted(self._pits.values(), key=lambda p: p["_seen"])]
             return {
-                "status": "live" if (time.time() - self._last_event_time < 300) else "completed",
-                "session_name": self._session_info.get("Name", "Practice 1"),
-                "circuit_short_name": circuit_name,
-                "country_name": country_name,
-                "session_key": self._session_info.get("Key", 20260911),
+                "status": self._status(),
+                "session_status": self._session_status or None,
+                "session_name": self._session_info.get("Name"),
+                "session_type": self._session_info.get("Type"),
+                "session_part": self._session_part(),
+                "circuit_short_name": (meeting.get("Circuit") or {}).get("ShortName"),
+                "country_name": (meeting.get("Country") or {}).get("Name"),
+                "meeting_name": meeting.get("Name"),
+                "session_key": self._session_info.get("Key"),
+                "date_start": self._session_utc("StartDate"),
+                "date_end": self._session_utc("EndDate"),
                 "timestamp": time.time(),
-                "track_flag": track_msg,
-                "race_control_messages": rc_msgs,
-                "leaderboard": leaderboard,
-                "engine": "livef1-signalr"
+                "track_flag": self._track_status.get("Message"),
+                "track_status": self._track_status.get("Status"),
+                "current_lap": self._lap_count.get("CurrentLap"),
+                "total_laps": self._lap_count.get("TotalLaps"),
+                "race_control_messages": self._race_control_out(),
+                "leaderboard": self._leaderboard(),
+                "positions": self._positions_out(),
+                "car_data": self._car_data_out(),
+                "team_radio": [r for r in radio if r["recording_url"] and r["driver_number"] is not None],
+                "pit_stops": pits,
+                "engine": "f1-livetiming-signalr",
             }
 
+    async def get_live_positions(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"session_key": self._session_info.get("Key"), "positions": self._positions_out(), "car_data": self._car_data_out()}
+
     async def get_live_weather(self) -> Dict[str, Any]:
-        """Returns the latest track and air weather conditions."""
-        with self._state_lock:
-            air = self._weather_data.get("AirTemp")
-            track = self._weather_data.get("TrackTemp")
-            hum = self._weather_data.get("Humidity")
-            wind = self._weather_data.get("WindSpeed")
-            rain = self._weather_data.get("Rainfall")
+        with self._lock:
+            w = self._weather
+            rain = w.get("Rainfall")
             return {
-                "air_temperature": float(air) if air else 25.0,
-                "track_temperature": float(track) if track else 32.0,
-                "humidity": float(hum) if hum else 45.0,
-                "wind_speed": float(wind) if wind else 10.0,
-                "rainfall": bool(int(rain) > 0) if rain is not None else False,
-                "timestamp": str(self._weather_data.get("Utc", time.time()))
+                "air_temperature": _num(w.get("AirTemp")),
+                "track_temperature": _num(w.get("TrackTemp")),
+                "humidity": _num(w.get("Humidity")),
+                "wind_speed": _num(w.get("WindSpeed")),
+                "wind_direction": _num(w.get("WindDirection")),
+                "pressure": _num(w.get("Pressure")),
+                "rainfall": None if rain is None else (_num(rain) or 0) > 0,
+                "timestamp": w.get("Utc"),
             }
 
     async def get_race_control(self) -> List[Dict[str, Any]]:
-        """Returns recent race control messages (flags, safety car)."""
-        with self._state_lock:
-            return list(self._race_control_messages)
+        with self._lock:
+            return self._race_control_out()
+
+    # ---------------------------------------------------------------- Jolpica passthrough
+
+    async def _jolpica(self, key: str, path: str) -> Dict[str, Any]:
+        if key in meta_cache:
+            return meta_cache[key]
+        try:
+            res = await self._client.get(f"{JOLPICA_BASE}/{path}")
+            if res.status_code == 200:
+                meta_cache[key] = res.json()
+                return meta_cache[key]
+        except Exception as e:
+            logger.error(f"{key} error: {e}")
+        return {}
 
     async def get_calendar(self) -> Dict[str, Any]:
-        """Returns 2026 championship calendar."""
-        if "calendar" in meta_cache:
-            return meta_cache["calendar"]
-        try:
-            res = await self._client.get(f"{JOLPICA_BASE}/current.json")
-            if res.status_code == 200:
-                data = res.json()
-                meta_cache["calendar"] = data
-                return data
-        except Exception as e:
-            logger.error(f"Calendar error: {e}")
-        return {}
+        return await self._jolpica("calendar", "current.json")
 
     async def get_driver_standings(self) -> Dict[str, Any]:
-        """Returns 2026 Drivers Championship standings."""
-        if "driver_standings" in meta_cache:
-            return meta_cache["driver_standings"]
-        try:
-            res = await self._client.get(f"{JOLPICA_BASE}/current/driverStandings.json")
-            if res.status_code == 200:
-                data = res.json()
-                meta_cache["driver_standings"] = data
-                return data
-        except Exception as e:
-            logger.error(f"Driver standings error: {e}")
-        return {}
+        return await self._jolpica("driver_standings", "current/driverStandings.json")
 
     async def get_constructor_standings(self) -> Dict[str, Any]:
-        """Returns 2026 Constructors Championship standings."""
-        if "constructor_standings" in meta_cache:
-            return meta_cache["constructor_standings"]
-        try:
-            res = await self._client.get(f"{JOLPICA_BASE}/current/constructorStandings.json")
-            if res.status_code == 200:
-                data = res.json()
-                meta_cache["constructor_standings"] = data
-                return data
-        except Exception as e:
-            logger.error(f"Constructor standings error: {e}")
-        return {}
+        return await self._jolpica("constructor_standings", "current/constructorStandings.json")
 
     async def close(self):
         self.stop()

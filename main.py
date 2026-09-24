@@ -41,7 +41,7 @@ async def root():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
-    return {"status": "ok", "service": "pitwall-livef1"}
+    return {"status": "ok", "service": "pitwall-livef1", "feed": engine.health()}
 
 @app.api_route("/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def privacy_policy():
@@ -58,6 +58,11 @@ async def privacy_policy():
 async def get_live_timing(response: Response):
     response.headers["Cache-Control"] = "public, max-age=5"
     return await engine.get_live_timing()
+
+@app.get("/api/v1/live/positions")
+async def get_live_positions(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return await engine.get_live_positions()
 
 @app.get("/api/v1/live/weather")
 async def get_live_weather(response: Response):
