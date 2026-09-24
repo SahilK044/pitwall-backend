@@ -4,6 +4,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from live_engine import engine
+from auth_manager import auth_manager
 
 PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
@@ -63,6 +64,20 @@ async def get_live_timing(response: Response):
 async def get_live_positions(response: Response):
     response.headers["Cache-Control"] = "no-store"
     return await engine.get_live_positions()
+
+@app.get("/api/v1/live/telemetry")
+async def get_live_telemetry(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return await engine.get_live_telemetry()
+
+@app.get("/api/v1/auth/status")
+async def get_auth_status():
+    token = auth_manager.get_token()
+    return auth_manager.inspect_token(token)
+
+@app.post("/api/v1/auth/refresh")
+async def refresh_auth_token():
+    return auth_manager.refresh()
 
 @app.get("/api/v1/live/weather")
 async def get_live_weather(response: Response):

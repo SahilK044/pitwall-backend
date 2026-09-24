@@ -25,6 +25,7 @@ import httpx
 import requests
 from cachetools import TTLCache
 from signalrcore.hub_connection_builder import HubConnectionBuilder
+from auth_manager import auth_manager
 
 logger = logging.getLogger("livef1_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -141,7 +142,7 @@ class LiveF1Engine:
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=10.0)
         self._lock = threading.Lock()
-        self._token = load_f1tv_token()
+        self._token = auth_manager.get_token() or load_f1tv_token()
         self._token_exp = token_expiry(self._token) if self._token else None
         self._reset_state()
         self._last_event_time: float = 0.0
@@ -169,6 +170,7 @@ class LiveF1Engine:
 
     def start(self):
         self._stopped = False
+        auth_manager.start_scheduler()
         if not self._token:
             # Timing, tyres, radio, race control and weather are public; only car positions and
             # telemetry (CarData.z, Position.z) need an F1 TV Pro token.
@@ -183,6 +185,7 @@ class LiveF1Engine:
     def stop(self):
         self._stopped = True
         self._is_connected = False
+        auth_manager.stop_scheduler()
         if self._connection:
             try:
                 self._connection.stop()
@@ -211,10 +214,10 @@ class LiveF1Engine:
                 except Exception as ex:
                     logger.warning(f"Pre-negotiate cookie fetch failed: {ex}")
 
-                token = self._token
+                token = auth_manager.get_token() or self._token
                 options = {"verify_ssl": True, "headers": headers}
                 if token:
-                    options["access_token_factory"] = lambda: token
+                    options["access_token_factory"] = lambda: auth_manager.get_token()
                 conn = HubConnectionBuilder() \
                     .with_url(ws_url, options=options) \
                     .configure_logging(logging.WARNING) \
@@ -546,6 +549,10 @@ class LiveF1Engine:
     async def get_live_positions(self) -> Dict[str, Any]:
         with self._lock:
             return {"session_key": self._session_info.get("Key"), "positions": self._positions_out(), "car_data": self._car_data_out()}
+
+    async def get_live_telemetry(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"session_key": self._session_info.get("Key"), "car_data": self._car_data_out()}
 
     async def get_live_weather(self) -> Dict[str, Any]:
         with self._lock:
