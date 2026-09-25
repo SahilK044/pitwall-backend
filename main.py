@@ -92,6 +92,34 @@ async def update_auth_token(payload: TokenPayload):
     engine.update_token(token)
     return {"success": True, "token_info": info}
 
+@app.get("/auth/sync", response_class=HTMLResponse)
+@app.get("/api/v1/auth/sync", response_class=HTMLResponse)
+async def sync_token_via_browser(token: str):
+    info = auth_manager.set_token(token.strip())
+    if not info.get("valid"):
+        return HTMLResponse(
+            f"<html><body style='font-family:sans-serif;background:#1a1a1a;color:#ff5252;text-align:center;padding:40px;'>"
+            f"<h2>❌ Sync Failed</h2><p>{info.get('error', 'Invalid token')}</p>"
+            f"</body></html>",
+            status_code=400
+        )
+    engine.update_token(token.strip())
+    rem_h = info.get("remaining_seconds", 0) // 3600
+    return HTMLResponse(
+        f"<html><head><title>Pitwall Sync</title></head>"
+        f"<body style='font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#f0f6fc;text-align:center;padding:50px;'>"
+        f"<div style='max-width:400px;margin:0 auto;background:#161b22;padding:30px;border-radius:12px;border:1px solid #30363d;box-shadow:0 8px 24px rgba(0,0,0,0.5);'>"
+        f"<h2 style='color:#3fb950;margin-top:0;'>✅ Synced to Pitwall!</h2>"
+        f"<p style='font-size:16px;margin:8px 0;'><b>Subscriber:</b> {info.get('first_name', '')} {info.get('last_name', '')}</p>"
+        f"<p style='font-size:14px;color:#8b949e;margin:4px 0;'><b>Tier:</b> {info.get('subscribed_product', 'PRO')}</p>"
+        f"<p style='font-size:14px;color:#8b949e;margin:4px 0;'><b>Valid for:</b> {rem_h} hours</p>"
+        f"<p style='font-size:12px;color:#8b949e;margin:4px 0;'>Expires: {info.get('exp_utc')}</p>"
+        f"<p style='color:#58a6ff;font-size:12px;margin-top:20px;'>Closing window automatically...</p>"
+        f"</div>"
+        f"<script>setTimeout(() => window.close(), 3000);</script>"
+        f"</body></html>"
+    )
+
 @app.get("/api/v1/live/weather")
 async def get_live_weather(response: Response):
     response.headers["Cache-Control"] = "public, max-age=15"
