@@ -2,6 +2,7 @@
 """
 F1TV Token Auto-Refresher via Playwright
 Extracts a fresh entitlement_token from F1TV and syncs it to the Pitwall backend.
+Handles SourcePoint and OneTrust cookie consent overlays gracefully.
 """
 
 import os
@@ -67,6 +68,47 @@ def push_to_backend(token: str) -> bool:
     return False
 
 
+def dismiss_cookie_banners(page):
+    """Dismisses both SourcePoint and OneTrust cookie consent overlays."""
+    # 1. Click accept inside SourcePoint iframe if present
+    try:
+        frame = page.frame_locator('iframe[id^="sp_message_iframe"]')
+        btn = frame.locator('button[title*="Accept"], button:has-text("ACCEPT ALL"), button:has-text("Accept All"), button:has-text("Accept")')
+        if btn.is_visible(timeout=2500):
+            btn.click(force=True)
+            logger.info("Dismissed SourcePoint consent dialog via button.")
+            time.sleep(1)
+    except Exception:
+        pass
+
+    # 2. Click accept in OneTrust banner if present
+    try:
+        onetrust_btn = page.locator('#onetrust-accept-btn-handler, button:has-text("Accept All")').first
+        if onetrust_btn.is_visible(timeout=1500):
+            onetrust_btn.click(force=True)
+            logger.info("Dismissed OneTrust banner.")
+            time.sleep(1)
+    except Exception:
+        pass
+
+    # 3. Force-remove any lingering overlay elements that intercept clicks
+    try:
+        page.evaluate("""() => {
+            const selectors = [
+                '[id^="sp_message_container"]',
+                'iframe[id^="sp_message_iframe"]',
+                '.message-container',
+                '#onetrust-consent-sdk',
+                '.onetrust-pc-dark-filter'
+            ];
+            selectors.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => el.remove());
+            });
+        }""")
+    except Exception:
+        pass
+
+
 def run():
     try:
         from playwright.sync_api import sync_playwright
@@ -102,7 +144,6 @@ def run():
                 logger.info(f"Using storage state file: {F1_STORAGE_STATE}")
             else:
                 try:
-                    # Treat as JSON string
                     state_data = json.loads(F1_STORAGE_STATE)
                     temp_state_file = Path("temp_storage_state.json")
                     temp_state_file.write_text(json.dumps(state_data), encoding="utf-8")
@@ -140,8 +181,9 @@ def run():
         # 1. First attempt: Visit F1TV directly (works if session cookies are valid)
         logger.info("Navigating to https://f1tv.formula1.com ...")
         try:
-            page.goto("https://f1tv.formula1.com", timeout=30000, wait_until="networkidle")
-            time.sleep(3)
+            page.goto("https://f1tv.formula1.com", timeout=30000, wait_until="domcontentloaded")
+            time.sleep(2)
+            dismiss_cookie_banners(page)
         except Exception as e:
             logger.warning(f"Initial navigation notice: {e}")
 
@@ -158,32 +200,35 @@ def run():
             logger.info("Session not active. Attempting login with credentials...")
             try:
                 page.goto("https://account.formula1.com/#/en/login", timeout=30000, wait_until="domcontentloaded")
-                time.sleep(2)
+                time.sleep(3)
+                dismiss_cookie_banners(page)
 
-                # Dismiss cookie consent if present
-                try:
-                    consent_btn = page.query_selector("#onetrust-accept-btn-handler") or page.query_selector("button:has-text('Accept All')")
-                    if consent_btn:
-                        consent_btn.click()
-                        time.sleep(1)
-                except Exception:
-                    pass
+                logger.info("Locating login form...")
+                login_input = page.locator('input[name="Login"], input[type="email"], .txtLogin').first
+                login_input.wait_for(state="visible", timeout=15000)
+                dismiss_cookie_banners(page)
 
-                # Fill login form
-                logger.info("Submitting login form...")
-                page.fill('input[name="Login"], input[type="email"]', F1_EMAIL)
-                page.fill('input[name="Password"], input[type="password"]', F1_PASSWORD)
+                logger.info("Filling credentials...")
+                login_input.fill(F1_EMAIL, force=True)
+                time.sleep(0.5)
+
+                pwd_input = page.locator('input[name="Password"], input[type="password"], .txtPassword').first
+                pwd_input.fill(F1_PASSWORD, force=True)
                 time.sleep(1)
 
-                submit_btn = page.query_selector('button[type="submit"]') or page.query_selector('.actions button')
-                if submit_btn:
-                    submit_btn.click()
-                    page.wait_for_timeout(5000)
+                logger.info("Submitting login form...")
+                submit_btn = page.locator('button[type="submit"], .loginForm button, button:has-text("Sign in")').first
+                submit_btn.click(force=True)
 
-                # Redirect to F1TV
-                logger.info("Returning to F1TV to mint entitlement token...")
-                page.goto("https://f1tv.formula1.com", timeout=30000, wait_until="networkidle")
-                time.sleep(3)
+                logger.info("Waiting for authentication response...")
+                time.sleep(6)
+                dismiss_cookie_banners(page)
+
+                # Redirect to F1TV to mint entitlement token
+                logger.info("Navigating to F1TV to generate entitlement token...")
+                page.goto("https://f1tv.formula1.com", timeout=30000, wait_until="domcontentloaded")
+                time.sleep(4)
+                dismiss_cookie_banners(page)
 
                 cookies = context.cookies(["https://f1tv.formula1.com", "https://formula1.com"])
                 for c in cookies:
