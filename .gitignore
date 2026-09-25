@@ -7,3 +7,6 @@ __pycache__/
 env/
 venv/
 .env
+auth.json
+*.jsonl
+temp_storage_state.json
