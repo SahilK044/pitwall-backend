@@ -62,6 +62,32 @@ class F1AuthManager:
                 self._do_refresh()
             return self._token
 
+    def set_token(self, token: str) -> Dict[str, Any]:
+        """Manually updates the entitlement token and writes to .env if available."""
+        token = token.strip()
+        info = self.inspect_token(token)
+        if not info.get("valid"):
+            return info
+        with self._lock:
+            self._token = token
+            if ENV_FILE.exists():
+                try:
+                    lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+                    new_lines = []
+                    found = False
+                    for line in lines:
+                        if line.strip().startswith("F1TV_TOKEN="):
+                            new_lines.append(f"F1TV_TOKEN={token}")
+                            found = True
+                        else:
+                            new_lines.append(line)
+                    if not found:
+                        new_lines.append(f"F1TV_TOKEN={token}")
+                    ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                except Exception as e:
+                    logger.warning(f"Could not persist token to .env: {e}")
+        return info
+
     def is_expiring(self, threshold_minutes: int = 60) -> bool:
         """Checks if token expires within the specified number of minutes."""
         info = self.inspect_token(self._token)

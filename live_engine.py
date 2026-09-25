@@ -201,6 +201,18 @@ class LiveF1Engine:
             "last_event_age_s": round(time.time() - self._last_event_time, 1) if self._last_event_time else None,
         }
 
+    def update_token(self, token: str):
+        """Updates the active token and triggers a SignalR reconnect."""
+        with self._lock:
+            self._token = token.strip()
+            self._token_exp = token_expiry(self._token)
+        logger.info(f"Live engine token updated. New expiry: {self._token_exp}")
+        if self._connection:
+            try:
+                self._connection.stop()
+            except Exception as e:
+                logger.warning(f"Error resetting SignalR connection for new token: {e}")
+
     def _run_signalr(self):
         negotiate_url = f"{LIVETIMING_BASE}/signalrcore/negotiate"
         ws_url = "wss://livetiming.formula1.com/signalrcore"

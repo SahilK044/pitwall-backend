@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from live_engine import engine
 from auth_manager import auth_manager
 
@@ -78,6 +79,18 @@ async def get_auth_status():
 @app.post("/api/v1/auth/refresh")
 async def refresh_auth_token():
     return auth_manager.refresh()
+
+class TokenPayload(BaseModel):
+    token: str
+
+@app.post("/api/v1/auth/token")
+async def update_auth_token(payload: TokenPayload):
+    token = payload.token.strip()
+    info = auth_manager.set_token(token)
+    if not info.get("valid"):
+        return {"success": False, "error": info.get("error", "Invalid token")}
+    engine.update_token(token)
+    return {"success": True, "token_info": info}
 
 @app.get("/api/v1/live/weather")
 async def get_live_weather(response: Response):
