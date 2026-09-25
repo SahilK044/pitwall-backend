@@ -55,6 +55,15 @@ class F1AuthManager:
     def stop_scheduler(self):
         self._running = False
 
+    def current_token(self) -> str:
+        """The token held now, without trying a renewal (never blocks on the network)."""
+        return self._token
+
+    def public_status(self) -> Dict[str, Any]:
+        """Expiry only. The JWT also names the account holder; that is never served."""
+        info = self.inspect_token(self._token)
+        return {k: info.get(k) for k in ("valid", "error", "exp_utc", "iat_utc", "remaining_seconds", "is_expired")}
+
     def get_token(self) -> str:
         """Returns the current valid entitlement token. Auto-refreshes if nearing expiry."""
         with self._lock:

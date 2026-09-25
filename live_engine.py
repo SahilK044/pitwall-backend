@@ -37,8 +37,11 @@ meta_cache: TTLCache[str, Any] = TTLCache(maxsize=100, ttl=3600)
 TOPICS = [
     "Heartbeat", "SessionInfo", "SessionStatus", "DriverList", "TimingData", "TimingAppData",
     "TrackStatus", "WeatherData", "RaceControlMessages", "LapCount", "TeamRadio",
-    "PitLaneTimeCollection", "CarData.z", "Position.z",
+    "PitLaneTimeCollection", "CarData.z", "Position.z", "ExtrapolatedClock",
 ]
+
+# A feed list is patched by index; a bogus huge index must not grow it without bound.
+MAX_LIST_INDEX = 1000
 
 # CarData channel ids in the F1 feed.
 CH_RPM, CH_SPEED, CH_GEAR, CH_THROTTLE, CH_BRAKE, CH_DRS = "0", "2", "3", "4", "5", "45"
@@ -98,6 +101,8 @@ def merge(target: Any, source: Any) -> Any:
                 i = int(k)
             except (TypeError, ValueError):
                 continue
+            if not 0 <= i < MAX_LIST_INDEX:
+                continue
             while len(target) <= i:
                 target.append({})
             target[i] = merge(target[i], v)
@@ -130,12 +135,36 @@ def parse_lap_str(t: Any) -> Optional[float]:
         return None
 
 
+def _int(v: Any) -> Optional[int]:
+    """A feed number as an int; None when absent or not a number (never raises)."""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_list(container: Any) -> List[Any]:
     if isinstance(container, list):
         return container
     if isinstance(container, dict):
         return [container[k] for k in sorted(container, key=lambda x: int(x) if str(x).isdigit() else 0)]
     return []
+
+
+def quali_break(session_name: str, part: Optional[int], status: str, clock_remaining: Any) -> bool:
+    """Qualifying between segments, from the feed as it ran in Baku (2026-09-25): a segment ends
+    "Finished" with the clock at zero; SessionPart moves on and the clock is reset a minute before
+    the next segment; the status reads "Inactive" until it starts. Q3 finishing ends the session."""
+    if "Qualifying" not in session_name and "Shootout" not in session_name:
+        return False
+    part = part or 0
+    reset = str(clock_remaining or "").strip() not in ("", "00:00:00", "0:00:00")
+    if status == "Finished":
+        return 1 <= part < 3 or (part == 3 and reset)
+    if status == "Inactive":
+        # Before Q1 the status is Inactive too, with SessionPart 1: that is not a break.
+        return part >= 2
+    return False
 
 
 class LiveF1Engine:
@@ -146,6 +175,10 @@ class LiveF1Engine:
         self._token_exp = token_expiry(self._token) if self._token else None
         self._reset_state()
         self._last_event_time: float = 0.0
+        # Which topics F1 actually sends (count, last time). CarData and Position only flow when
+        # the token is entitled to them, and this is the one place that shows whether they do.
+        self._topic_stats: Dict[str, Dict[str, Any]] = {}
+        self._snapshot_topics: List[str] = []
         self._hub_thread: Optional[threading.Thread] = None
         self._connection: Optional[Any] = None
         self._is_connected = False
@@ -158,8 +191,10 @@ class LiveF1Engine:
         self._timing: Dict[str, Any] = {}
         self._timing_app: Dict[str, Any] = {}
         self._weather: Dict[str, Any] = {}
+        self._weather_utc: Optional[str] = None
         self._track_status: Dict[str, Any] = {}
         self._lap_count: Dict[str, Any] = {}
+        self._clock: Dict[str, Any] = {}
         self._race_control: List[Dict[str, Any]] = []
         self._radio: List[Dict[str, Any]] = []
         self._pits: Dict[str, Dict[str, Any]] = {}
@@ -193,12 +228,22 @@ class LiveF1Engine:
                 logger.warning(f"Error stopping connection: {e}")
 
     def health(self) -> Dict[str, Any]:
+        # The token in use now: the auto-renewal may have replaced the one read at startup.
+        token = auth_manager.current_token() or self._token
+        exp = token_expiry(token) if token else None
         return {
             "connected": self._is_connected,
-            "token_set": bool(self._token),
-            "token_expires": self._token_exp.isoformat() if self._token_exp else None,
-            "token_expired": bool(self._token_exp and self._token_exp < datetime.now(timezone.utc)),
+            "token_set": bool(token),
+            "token_expires": exp.isoformat() if exp else None,
+            "token_expired": bool(exp and exp < datetime.now(timezone.utc)),
             "last_event_age_s": round(time.time() - self._last_event_time, 1) if self._last_event_time else None,
+            "snapshot_topics": list(self._snapshot_topics),
+            "topics": {
+                t: {"messages": v["count"], "last_age_s": round(time.time() - v["last"], 1)}
+                for t, v in sorted(self._topic_stats.items())
+            },
+            "car_data_flowing": self._flowing("CarData.z"),
+            "positions_flowing": self._flowing("Position.z"),
         }
 
     def update_token(self, token: str):
@@ -212,6 +257,15 @@ class LiveF1Engine:
                 self._connection.stop()
             except Exception as e:
                 logger.warning(f"Error resetting SignalR connection for new token: {e}")
+
+    def _flowing(self, topic: str) -> bool:
+        v = self._topic_stats.get(topic)
+        return bool(v and time.time() - v["last"] < 30)
+
+    def _count(self, topic: str):
+        v = self._topic_stats.setdefault(topic, {"count": 0, "last": 0.0})
+        v["count"] += 1
+        v["last"] = time.time()
 
     def _run_signalr(self):
         negotiate_url = f"{LIVETIMING_BASE}/signalrcore/negotiate"
@@ -272,13 +326,15 @@ class LiveF1Engine:
             result = getattr(m, "result", None)
             if not isinstance(result, dict):
                 continue
+            self._snapshot_topics = sorted(k for k, v in result.items() if v)
             with self._lock:
                 # SessionInfo first so a session change resets before the rest lands.
-                if "SessionInfo" in result:
-                    self._apply("SessionInfo", result["SessionInfo"], snapshot=True)
-                for topic, data in result.items():
-                    if topic != "SessionInfo":
+                ordered = sorted(result.items(), key=lambda kv: kv[0] != "SessionInfo")
+                for topic, data in ordered:
+                    try:
                         self._apply(topic, data, snapshot=True)
+                    except Exception as e:
+                        logger.warning(f"Error applying snapshot of {topic}: {e}")
             self._last_event_time = time.time()
             logger.info(f"Snapshot applied: {sorted(result.keys())}")
 
@@ -286,15 +342,16 @@ class LiveF1Engine:
         if not isinstance(data, list) or len(data) < 2:
             return
         self._last_event_time = time.time()
+        self._count(str(data[0]))
         with self._lock:
             try:
-                self._apply(data[0], data[1], snapshot=False)
+                self._apply(data[0], data[1], snapshot=False, utc=data[2] if len(data) > 2 else None)
             except Exception as e:
                 logger.warning(f"Error applying {data[0]}: {e}")
 
     # ---------------------------------------------------------------- topic handlers
 
-    def _apply(self, topic: str, payload: Any, snapshot: bool):
+    def _apply(self, topic: str, payload: Any, snapshot: bool, utc: Any = None):
         if topic.endswith(".z"):
             payload = inflate(payload)
             topic = topic[:-2]
@@ -321,6 +378,11 @@ class LiveF1Engine:
             merge(self._track_status, payload)
         elif topic == "WeatherData" and isinstance(payload, dict):
             merge(self._weather, payload)
+            # A snapshot carries no time: it may be the last session's reading, so it stays undated.
+            if not snapshot:
+                self._weather_utc = str(utc) if utc else datetime.now(timezone.utc).isoformat()
+        elif topic == "ExtrapolatedClock" and isinstance(payload, dict):
+            merge(self._clock, payload)
         elif topic == "LapCount" and isinstance(payload, dict):
             merge(self._lap_count, payload)
         elif topic == "RaceControlMessages" and isinstance(payload, dict):
@@ -457,6 +519,12 @@ class LiveF1Engine:
                 return v, state
 
             (s1, st1), (s2, st2), (s3, st3) = sector(0), sector(1), sector(2)
+
+            def segments(i: int) -> List[int]:
+                # Mini sectors as the feed codes them: 0 not run yet, 2048 slower, 2049 personal
+                # best, 2051 overall best, 2064 pit lane (other codes pass through untouched).
+                s = sectors[i] if len(sectors) > i and isinstance(sectors[i], dict) else {}
+                return [_int(g.get("Status")) or 0 for g in _as_list(s.get("Segments")) if isinstance(g, dict)]
             speeds = line.get("Speeds") or {}
             pos = line.get("Position")
             board.append({
@@ -469,6 +537,7 @@ class LiveF1Engine:
                 "interval": interval,
                 "sector1": s1, "sector2": s2, "sector3": s3,
                 "sector1_state": st1, "sector2_state": st2, "sector3_state": st3,
+                "mini_sectors": [segments(0), segments(1), segments(2)],
                 "speed_trap": _value(speeds.get("ST")) if isinstance(speeds, dict) else "",
                 "laps": line.get("NumberOfLaps"),
                 "in_pit": bool(line.get("InPit")),
@@ -501,20 +570,33 @@ class LiveF1Engine:
             brake = _num(c.get(CH_BRAKE))
             out.append({
                 "driver_number": int(num), "date": c.get("Utc"),
-                "rpm": int(c[CH_RPM]) if c.get(CH_RPM) is not None else None,
-                "speed": int(c[CH_SPEED]) if c.get(CH_SPEED) is not None else None,
-                "n_gear": int(c[CH_GEAR]) if c.get(CH_GEAR) is not None else None,
-                "throttle": int(c[CH_THROTTLE]) if c.get(CH_THROTTLE) is not None else None,
+                "rpm": _int(c.get(CH_RPM)),
+                "speed": _int(c.get(CH_SPEED)),
+                "n_gear": _int(c.get(CH_GEAR)),
+                "throttle": _int(c.get(CH_THROTTLE)),
                 # The feed sends brake as on/off (0 or 1, sometimes 100); served as 0 or 100.
                 "brake": None if brake is None else (100 if brake > 0 else 0),
-                "drs": int(c[CH_DRS]) if c.get(CH_DRS) is not None else None,
+                "drs": _int(c.get(CH_DRS)),
             })
         return out
+
+    def _quali_break(self) -> bool:
+        """Qualifying between segments. F1 marks each segment "Finished", then "Inactive" until the
+        next one starts (seen in Baku qualifying, 2026-09-25); only Q3 finishing, "Finalised" or
+        "Ends" end the session."""
+        name = str(self._session_info.get("Name") or "")
+        return quali_break(name, self._session_part(), self._session_status, self._clock.get("Remaining"))
 
     def _status(self) -> str:
         if not self._timing.get("Lines"):
             return "idle"
         recent = time.time() - self._last_event_time < 300
+        if self._quali_break():
+            return "live" if recent else "completed"
+        # Before the green light the feed already carries the next session as "Inactive" and keeps
+        # sending heartbeats: that is not live yet.
+        if self._session_status == "Inactive":
+            return "idle"
         finished = self._session_status in ("Finished", "Finalised", "Ends")
         return "live" if recent and not finished else "completed"
 
@@ -538,6 +620,7 @@ class LiveF1Engine:
                 "session_name": self._session_info.get("Name"),
                 "session_type": self._session_info.get("Type"),
                 "session_part": self._session_part(),
+                "quali_break": self._quali_break(),
                 "circuit_short_name": (meeting.get("Circuit") or {}).get("ShortName"),
                 "country_name": (meeting.get("Country") or {}).get("Name"),
                 "meeting_name": meeting.get("Name"),
@@ -549,6 +632,11 @@ class LiveF1Engine:
                 "track_status": self._track_status.get("Status"),
                 "current_lap": self._lap_count.get("CurrentLap"),
                 "total_laps": self._lap_count.get("TotalLaps"),
+                # The official session clock: time left at clock_utc, counting down while extrapolating
+                # (it stops under a red flag and between qualifying segments).
+                "clock_remaining": self._clock.get("Remaining"),
+                "clock_utc": self._clock.get("Utc"),
+                "clock_extrapolating": self._clock.get("Extrapolating"),
                 "race_control_messages": self._race_control_out(),
                 "leaderboard": self._leaderboard(),
                 "positions": self._positions_out(),
@@ -578,7 +666,7 @@ class LiveF1Engine:
                 "wind_direction": _num(w.get("WindDirection")),
                 "pressure": _num(w.get("Pressure")),
                 "rainfall": None if rain is None else (_num(rain) or 0) > 0,
-                "timestamp": w.get("Utc"),
+                "timestamp": self._weather_utc,
             }
 
     async def get_race_control(self) -> List[Dict[str, Any]]:

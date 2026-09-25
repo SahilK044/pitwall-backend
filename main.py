@@ -1,6 +1,11 @@
+import hmac
+import json
+import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, Response
+from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,11 +28,13 @@ app = FastAPI(
 )
 
 # Enable CORS for web and mobile clients
+# Public, read-only data: any origin may read it, but without cookies or credentials
+# ("*" with credentials makes Starlette echo every Origin back as allowed).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD"],
     allow_headers=["*"],
 )
 
@@ -56,10 +63,17 @@ async def privacy_policy():
         )
     return HTMLResponse(content="<h1>Privacy Policy Not Found</h1>", status_code=404)
 
+# Every poller shares one rendering per second: the snapshot is the biggest payload and during a
+# race each app polls it every few seconds. no-store, so no HTTP cache serves it older than that.
+_timing_cache = {"at": 0.0, "body": b""}
+
 @app.get("/api/v1/live/timing")
-async def get_live_timing(response: Response):
-    response.headers["Cache-Control"] = "public, max-age=5"
-    return await engine.get_live_timing()
+async def get_live_timing():
+    now = time.monotonic()
+    if not _timing_cache["body"] or now - _timing_cache["at"] >= 1.0:
+        _timing_cache["body"] = json.dumps(await engine.get_live_timing(), separators=(",", ":")).encode("utf-8")
+        _timing_cache["at"] = now
+    return Response(_timing_cache["body"], media_type="application/json", headers={"Cache-Control": "no-store"})
 
 @app.get("/api/v1/live/positions")
 async def get_live_positions(response: Response):
@@ -71,14 +85,21 @@ async def get_live_telemetry(response: Response):
     response.headers["Cache-Control"] = "no-store"
     return await engine.get_live_telemetry()
 
+# Token status is public but carries only the expiry: the F1 TV token's claims name the account holder.
 @app.get("/api/v1/auth/status")
-async def get_auth_status():
-    token = auth_manager.get_token()
-    return auth_manager.inspect_token(token)
+def get_auth_status():
+    return auth_manager.public_status()
 
+# Forcing a renewal uses the account's session with F1 TV, so it needs the admin key
+# (PITWALL_ADMIN_KEY on the host, sent as X-Admin-Key). Without a configured key it is off.
+# A plain def: FastAPI runs it on a worker thread, so the blocking renewal never stalls other requests.
 @app.post("/api/v1/auth/refresh")
-async def refresh_auth_token():
-    return auth_manager.refresh()
+def refresh_auth_token(x_admin_key: Optional[str] = Header(default=None)):
+    admin_key = os.environ.get("PITWALL_ADMIN_KEY", "")
+    if not admin_key or not x_admin_key or not hmac.compare_digest(x_admin_key.encode(), admin_key.encode()):
+        raise HTTPException(status_code=404)
+    info = auth_manager.refresh()
+    return {**auth_manager.public_status(), "refreshed": info.get("refreshed")}
 
 class TokenPayload(BaseModel):
     token: str
