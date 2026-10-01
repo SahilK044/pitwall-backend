@@ -53,7 +53,12 @@ def push_to_backend(token: str) -> bool:
     url = f"{BACKEND_URL}/api/v1/auth/token"
     logger.info(f"Pushing fresh token to {url}...")
     try:
-        res = requests.post(url, json={"token": token}, timeout=15)
+        # The backend only accepts a new token with the admin key (PITWALL_ADMIN_KEY, same value as on Render).
+        admin_key = os.environ.get("PITWALL_ADMIN_KEY", "")
+        if not admin_key:
+            logger.error("PITWALL_ADMIN_KEY is not set: the backend will refuse the token")
+            return False
+        res = requests.post(url, json={"token": token}, headers={"X-Admin-Key": admin_key}, timeout=15)
         if res.status_code == 200:
             data = res.json()
             if data.get("success"):

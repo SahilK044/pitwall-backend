@@ -38,5 +38,6 @@ jobs:
           F1_PASSWORD: ${{ secrets.F1_PASSWORD }}
           F1_STORAGE_STATE: ${{ secrets.F1_STORAGE_STATE }}
           BACKEND_URL: ${{ secrets.BACKEND_URL || 'https://pitwall-backend-rj02.onrender.com' }}
+          PITWALL_ADMIN_KEY: ${{ secrets.PITWALL_ADMIN_KEY }}
         run: |
           python scripts/refresh_token.py

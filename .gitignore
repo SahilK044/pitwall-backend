@@ -10,3 +10,4 @@ venv/
 auth.json
 *.jsonl
 temp_storage_state.json
+data/
