@@ -451,8 +451,13 @@ async def make_pick(p: PickIn, request: Request, x_pitwall_user: Optional[str] =
     grid = {g["driver_id"] for g in await data.grid()}
     if any(d not in grid for d in p.podium):
         raise HTTPException(400, "That driver isn't on the grid for this race")
-    await asyncio.to_thread(store.upsert_pick, await data.season(), p.round, user, p.podium)
-    # the crowd's split refreshes on its 15 s cache; recounting on every pick would stall the loop
+    season = await data.season()
+    await asyncio.to_thread(store.upsert_pick, season, p.round, user, p.podium)
+    # The fan should see their own pick counted: let the crowd's split recount within ~2 s rather
+    # than its usual 15 s (at most one recount per 2 s, however many picks arrive).
+    hit = _dist_cache.get((season, p.round))
+    if hit and time.time() - hit[0] > 2:
+        _dist_cache.pop((season, p.round), None)
     return {"ok": True, "round": p.round, "podium": p.podium}
 
 
