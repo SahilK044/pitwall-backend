@@ -26,6 +26,7 @@ import requests
 from cachetools import TTLCache
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 from auth_manager import auth_manager
+import radio_transcriber
 
 logger = logging.getLogger("livef1_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -183,6 +184,8 @@ class LiveF1Engine:
         self._connection: Optional[Any] = None
         self._is_connected = False
         self._stopped = False
+        # Team radio to text (off unless GROQ_API_KEY or OPENAI_API_KEY is set).
+        self._transcriber = radio_transcriber.RadioTranscriber(radio_transcriber.provider_from_env())
 
     def _reset_state(self):
         self._session_info: Dict[str, Any] = {}
@@ -213,6 +216,7 @@ class LiveF1Engine:
         if self._token_exp:
             left = (self._token_exp - datetime.now(timezone.utc)).total_seconds() / 3600
             logger.info(f"F1 TV token expires {self._token_exp.isoformat()} ({left:.1f} h left).")
+        self._transcriber.start()
         if self._hub_thread is None or not self._hub_thread.is_alive():
             self._hub_thread = threading.Thread(target=self._run_signalr, daemon=True, name="SignalR-Worker")
             self._hub_thread.start()
@@ -242,6 +246,7 @@ class LiveF1Engine:
                 t: {"messages": v["count"], "last_age_s": round(time.time() - v["last"], 1)}
                 for t, v in sorted(self._topic_stats.items())
             },
+            "radio_transcription": self._transcriber.provider.name if self._transcriber.enabled else None,
             "car_data_flowing": self._flowing("CarData.z"),
             "positions_flowing": self._flowing("Position.z"),
         }
@@ -398,6 +403,10 @@ class LiveF1Engine:
                 if isinstance(c, dict) and c.get("Path") and c.get("Path") not in seen:
                     self._radio.append(c)
                     seen.add(c.get("Path"))
+                    url = self._radio_url(c)
+                    # Only live clips: the snapshot's backlog would spend the quota on old radio.
+                    if url and not snapshot:
+                        self._transcriber.submit(url, radio_transcriber.build_prompt(self._drivers, c.get("RacingNumber")))
             self._radio = self._radio[-200:]
         elif topic == "PitLaneTimeCollection" and isinstance(payload, dict):
             for num, pit in (payload.get("PitTimes") or {}).items():
@@ -600,6 +609,10 @@ class LiveF1Engine:
         finished = self._session_status in ("Finished", "Finalised", "Ends")
         return "live" if recent and not finished else "completed"
 
+    def _radio_url(self, c: Dict[str, Any]) -> Optional[str]:
+        path = self._session_info.get("Path") or ""
+        return f"{LIVETIMING_BASE}/static/{path}{c['Path']}" if path and c.get("Path") else None
+
     async def get_live_timing(self) -> Dict[str, Any]:
         with self._lock:
             meeting = self._session_info.get("Meeting") or {}
@@ -608,6 +621,7 @@ class LiveF1Engine:
                 "driver_number": int(c["RacingNumber"]) if str(c.get("RacingNumber", "")).isdigit() else None,
                 "date": c.get("Utc"),
                 "recording_url": f"{LIVETIMING_BASE}/static/{path}{c['Path']}" if path else None,
+                "transcript": self._transcriber.get(f"{LIVETIMING_BASE}/static/{path}{c['Path']}") if path else None,
             } for c in self._radio]
             pits = [{
                 "driver_number": int(p["RacingNumber"]),
