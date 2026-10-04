@@ -603,9 +603,23 @@ class LiveF1Engine:
         if self._quali_break():
             return "live" if recent else "completed"
         # Before the green light the feed already carries the next session as "Inactive" and keeps
-        # sending heartbeats: that is not live yet.
+        # sending heartbeats: that is not live yet.  BUT if we are inside the scheduled session
+        # window (start − 30 min … end + 2 h), a suspended / delayed start IS a live event.
         if self._session_status == "Inactive":
-            return "idle"
+            start_iso = self._session_utc("StartDate")
+            end_iso = self._session_utc("EndDate")
+            now = datetime.now(timezone.utc)
+            in_window = False
+            try:
+                if start_iso and end_iso:
+                    s = datetime.fromisoformat(start_iso)
+                    e = datetime.fromisoformat(end_iso)
+                    in_window = (s - timedelta(minutes=30)) <= now <= (e + timedelta(hours=2))
+            except Exception:
+                pass
+            if not in_window:
+                return "idle"
+            # Fall through → treat as live (delayed / suspended start)
         finished = self._session_status in ("Finished", "Finalised", "Ends")
         return "live" if recent and not finished else "completed"
 
