@@ -23,6 +23,8 @@ import re
 import sqlite3
 import threading
 import time
+import queue
+import contextlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +64,8 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS podium_results (
         season TEXT NOT NULL, round INTEGER NOT NULL, podium TEXT NOT NULL,
         race_name TEXT, scored_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (season, round))""",
+    # Team radio transcripts (radio_archive.py): one row per clip, text NULL when no speech was heard.
+    "CREATE TABLE IF NOT EXISTS radio_transcripts (url TEXT PRIMARY KEY, text TEXT, created_at DOUBLE PRECISION NOT NULL)",
     """CREATE TABLE IF NOT EXISTS players (
         user_id TEXT PRIMARY KEY, username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE,
         created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL)""",
@@ -81,48 +85,84 @@ class Store:
         self.url, self.path = url, path
         if not self.pg:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._local = threading.local()
+        self._pool = queue.Queue(maxsize=30)
         for stmt in SCHEMA:
-            self._run(stmt)
+            with self._get_conn() as c:
+                if self.pg:
+                    c.execute(self._sql(stmt))
+                else:
+                    c.execute(stmt)
 
-    def _conn(self):
-        c = getattr(self._local, "c", None)
-        if c is not None and self.pg and c.closed:
-            c = None                                  # the server dropped it (idle timeout); reconnect
-        if c is None:
-            if self.pg:
-                import psycopg
-                from psycopg.rows import dict_row
-                # prepare_threshold=None: poolers such as Neon's (PgBouncer, transaction mode) can't
-                # keep server-side prepared statements, which psycopg otherwise starts using.
-                c = psycopg.connect(self.url, autocommit=True, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
+    def _create_conn(self):
+        if self.pg:
+            import psycopg
+            from psycopg.rows import dict_row
+            return psycopg.connect(self.url, autocommit=True, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
+        else:
+            c = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.row_factory = sqlite3.Row
+            return c
+
+    @contextlib.contextmanager
+    def _get_conn(self):
+        try:
+            c = self._pool.get_nowait()
+            if self.pg and c.closed:
+                c = self._create_conn()
+        except queue.Empty:
+            c = self._create_conn()
+        
+        try:
+            yield c
+        finally:
+            if self.pg and c.closed:
+                pass
             else:
-                c = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
-                c.execute("PRAGMA journal_mode=WAL")
-                c.execute("PRAGMA synchronous=NORMAL")
-                c.row_factory = sqlite3.Row
-            self._local.c = c
-        return c
+                try:
+                    self._pool.put_nowait(c)
+                except queue.Full:
+                    c.close()
 
     def _sql(self, q: str) -> str:
         return q.replace("?", "%s") if self.pg else q
 
     def _run(self, q: str, args=(), conn=None):
-        c = conn or self._conn()
-        try:
-            return c.execute(self._sql(q), args)
-        except Exception:
-            if self.pg and conn is None and c.closed:  # one retry on a dropped connection
-                self._local.c = None
-                return self._conn().execute(self._sql(q), args)
-            raise
+        if conn:
+            return conn.execute(self._sql(q), args)
+        with self._get_conn() as c:
+            try:
+                return c.execute(self._sql(q), args)
+            except Exception:
+                if self.pg and c.closed:
+                    with self._get_conn() as c2:
+                        return c2.execute(self._sql(q), args)
+                raise
 
     def _one(self, q: str, args=()) -> Optional[Dict[str, Any]]:
-        r = self._run(q, args).fetchone()
-        return dict(r) if r is not None else None
+        with self._get_conn() as c:
+            try:
+                r = c.execute(self._sql(q), args).fetchone()
+            except Exception:
+                if self.pg and c.closed:
+                    with self._get_conn() as c2:
+                        r = c2.execute(self._sql(q), args).fetchone()
+                else:
+                    raise
+            return dict(r) if r is not None else None
 
     def _all(self, q: str, args=()) -> List[Dict[str, Any]]:
-        return [dict(r) for r in self._run(q, args).fetchall()]
+        with self._get_conn() as c:
+            try:
+                rows = c.execute(self._sql(q), args).fetchall()
+            except Exception:
+                if self.pg and c.closed:
+                    with self._get_conn() as c2:
+                        rows = c2.execute(self._sql(q), args).fetchall()
+                else:
+                    raise
+            return [dict(r) for r in rows]
 
     # picks
     def upsert_pick(self, season: str, rnd: int, user: str, podium: List[str]) -> None:
@@ -173,20 +213,20 @@ class Store:
             (f"UPDATE podium_picks SET points = {points}, hits = {hits} WHERE season=? AND round=?",
              (w1, w2, w3, w2, w1, w3, w3, w1, w2, w1, w2, w3, w1, w2, w3, season, rnd)),
         ]
-        c = self._conn()
-        if self.pg:
-            with c.transaction():
-                for q, a in steps:
-                    self._run(q, a, conn=c)
-        else:
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                for q, a in steps:
-                    self._run(q, a, conn=c)
-                c.execute("COMMIT")
-            except Exception:
-                c.execute("ROLLBACK")
-                raise
+        with self._get_conn() as c:
+            if self.pg:
+                with c.transaction():
+                    for q, a in steps:
+                        self._run(q, a, conn=c)
+            else:
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    for q, a in steps:
+                        self._run(q, a, conn=c)
+                    c.execute("COMMIT")
+                except Exception:
+                    c.execute("ROLLBACK")
+                    raise
         return int(self._one("SELECT COUNT(*) AS n FROM podium_picks WHERE season=? AND round=?", (season, rnd))["n"])
 
     def rounds_to_score(self, season: str) -> List[int]:
@@ -302,12 +342,34 @@ class RaceData:
         d = await self._cached("grid", f"{SEASON}/last/results.json", 3600)
         races = d["MRData"]["RaceTable"]["Races"]
         rows = races[0]["Results"] if races else []
-        return [{
-            "driver_id": r["Driver"]["driverId"], "code": r["Driver"].get("code"),
-            "given": r["Driver"].get("givenName"), "family": r["Driver"].get("familyName"),
-            "number": r["Driver"].get("permanentNumber") or r.get("number"),
-            "team": r["Constructor"]["name"],
-        } for r in rows]
+        
+        standings_d = await self._cached("standings", f"{SEASON}/driverStandings.json", 3600)
+        s_lists = standings_d["MRData"]["StandingsTable"]["StandingsLists"]
+        s_rows = s_lists[0]["DriverStandings"] if s_lists else []
+        
+        seen = set()
+        res = []
+        for r in rows:
+            did = r["Driver"]["driverId"]
+            seen.add(did)
+            res.append({
+                "driver_id": did, "code": r["Driver"].get("code"),
+                "given": r["Driver"].get("givenName"), "family": r["Driver"].get("familyName"),
+                "number": r["Driver"].get("permanentNumber") or r.get("number"),
+                "team": r["Constructor"]["name"],
+            })
+        for s in s_rows:
+            did = s["Driver"]["driverId"]
+            if did not in seen:
+                seen.add(did)
+                team = s["Constructors"][0]["name"] if s.get("Constructors") else ""
+                res.append({
+                    "driver_id": did, "code": s["Driver"].get("code"),
+                    "given": s["Driver"].get("givenName"), "family": s["Driver"].get("familyName"),
+                    "number": s["Driver"].get("permanentNumber") or s.get("number"),
+                    "team": team,
+                })
+        return res
 
     @staticmethod
     def start_of(race: Dict[str, Any]) -> float:
@@ -359,22 +421,32 @@ def _allow(key: str, per_min: int) -> bool:
 
 def _guard(request: Request, user: str, kind: str, per_min: int) -> None:
     ip = request.client.host if request.client else "?"
-    if not (_allow(f"ip:{ip}", IP_WRITES_PER_MIN) and _allow(f"{kind}:{user}", per_min)):
+    if not _allow(f"{kind}:{user}", per_min):
+        raise HTTPException(429, "Too many changes, try again in a minute")
+    if not _allow(f"ip:{ip}", IP_WRITES_PER_MIN):
         raise HTTPException(429, "Too many changes, try again in a minute")
 
 
 # ---------------------------------------------------------------- cached aggregates
 _dist_cache: Dict[Any, Any] = {}
 _board_cache: Dict[Any, Any] = {}
+_dist_locks: Dict[Any, asyncio.Lock] = {}
 
 
 async def _distribution(season: str, rnd: int) -> Dict[str, Any]:
     hit = _dist_cache.get((season, rnd))
     if hit and time.time() - hit[0] < 15:
         return hit[1]
-    v = await asyncio.to_thread(store.distribution, season, rnd)
-    _dist_cache[(season, rnd)] = (time.time(), v)
-    return v
+    lock = _dist_locks.setdefault((season, rnd), asyncio.Lock())
+    if lock.locked() and hit:
+        return hit[1]
+    async with lock:
+        hit = _dist_cache.get((season, rnd))
+        if hit and time.time() - hit[0] < 15:
+            return hit[1]
+        v = await asyncio.to_thread(store.distribution, season, rnd)
+        _dist_cache[(season, rnd)] = (time.time(), v)
+        return v
 
 
 # ---------------------------------------------------------------- API

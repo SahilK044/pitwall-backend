@@ -32,7 +32,7 @@ logger = logging.getLogger("livef1_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 LIVETIMING_BASE = "https://livetiming.formula1.com"
-JOLPICA_BASE = "https://api.jolpi.ca/ergast/f1"
+JOLPICA_BASE = os.environ.get("JOLPICA_BASE", "https://api.jolpi.ca/ergast/f1")
 meta_cache: TTLCache[str, Any] = TTLCache(maxsize=100, ttl=3600)
 
 TOPICS = [
@@ -63,13 +63,10 @@ def load_f1tv_token() -> str:
 
 def token_expiry(token: str) -> Optional[datetime]:
     """The JWT's exp claim, read without verifying the signature (it is only logged)."""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
-        return datetime.fromtimestamp(int(exp), tz=timezone.utc) if exp else None
-    except Exception:
-        return None
+    info = auth_manager.inspect_token(token)
+    if info.get("valid") and info.get("exp_timestamp"):
+        return datetime.fromtimestamp(info["exp_timestamp"], tz=timezone.utc)
+    return None
 
 
 def inflate(data: Any) -> Any:
@@ -122,17 +119,6 @@ def _num(v: Any) -> Optional[float]:
     try:
         return float(v)
     except (TypeError, ValueError):
-        return None
-
-
-def parse_lap_str(t: Any) -> Optional[float]:
-    s = _value(t)
-    if not s:
-        return None
-    try:
-        parts = s.split(":")
-        return float(parts[0]) * 60.0 + float(parts[1]) if len(parts) == 2 else float(parts[0])
-    except Exception:
         return None
 
 
@@ -207,7 +193,16 @@ class LiveF1Engine:
     # ---------------------------------------------------------------- connection
 
     def start(self):
-        self._stopped = False
+        if getattr(self, '_stop_event', None):
+            self._stop_event.set()
+        if self._hub_thread is not None and self._hub_thread.is_alive():
+            if self._connection:
+                try:
+                    self._connection.stop()
+                except Exception:
+                    pass
+            self._hub_thread.join(timeout=5.0)
+        self._stop_event = threading.Event()
         auth_manager.start_scheduler()
         if not self._token:
             # Timing, tyres, radio, race control and weather are public; only car positions and
@@ -217,12 +212,12 @@ class LiveF1Engine:
             left = (self._token_exp - datetime.now(timezone.utc)).total_seconds() / 3600
             logger.info(f"F1 TV token expires {self._token_exp.isoformat()} ({left:.1f} h left).")
         self._transcriber.start()
-        if self._hub_thread is None or not self._hub_thread.is_alive():
-            self._hub_thread = threading.Thread(target=self._run_signalr, daemon=True, name="SignalR-Worker")
-            self._hub_thread.start()
+        self._hub_thread = threading.Thread(target=self._run_signalr, args=(self._stop_event,), daemon=True, name="SignalR-Worker")
+        self._hub_thread.start()
 
     def stop(self):
-        self._stopped = True
+        if getattr(self, '_stop_event', None):
+            self._stop_event.set()
         self._is_connected = False
         auth_manager.stop_scheduler()
         if self._connection:
@@ -272,10 +267,10 @@ class LiveF1Engine:
         v["count"] += 1
         v["last"] = time.time()
 
-    def _run_signalr(self):
+    def _run_signalr(self, stop_event: threading.Event):
         negotiate_url = f"{LIVETIMING_BASE}/signalrcore/negotiate"
         ws_url = "wss://livetiming.formula1.com/signalrcore"
-        while not self._stopped:
+        while not stop_event.is_set():
             try:
                 headers = {}
                 try:
@@ -310,9 +305,9 @@ class LiveF1Engine:
                 conn.start()
                 # start() returns before on_open fires: wait for the handshake, then hold.
                 deadline = time.time() + 20
-                while not self._is_connected and not self._stopped and time.time() < deadline:
+                while not self._is_connected and not stop_event.is_set() and time.time() < deadline:
                     time.sleep(0.5)
-                while self._is_connected and not self._stopped:
+                while self._is_connected and not stop_event.is_set():
                     time.sleep(2)
                 try:
                     conn.stop()
@@ -321,7 +316,7 @@ class LiveF1Engine:
             except Exception as e:
                 logger.error(f"SignalR loop error: {e}")
                 self._is_connected = False
-            if not self._stopped:
+            if not stop_event.is_set():
                 time.sleep(5)
 
     def _on_snapshot(self, message: Any):
@@ -419,14 +414,14 @@ class LiveF1Engine:
                 ts = frame.get("Timestamp")
                 for num, e in (frame.get("Entries") or {}).items():
                     if isinstance(e, dict) and str(num).isdigit():
-                        self._positions[str(int(num))] = {**e, "Timestamp": ts}
+                        self._positions.setdefault(str(int(num)), {}).update({**e, "Timestamp": ts})
         elif topic == "CarData" and isinstance(payload, dict):
             for entry in payload.get("Entries") or []:
                 utc = entry.get("Utc")
                 for num, car in (entry.get("Cars") or {}).items():
                     ch = (car or {}).get("Channels") or {}
                     if str(num).isdigit():
-                        self._car_data[str(int(num))] = {**{k: ch.get(k) for k in ch}, "Utc": utc}
+                        self._car_data.setdefault(str(int(num)), {}).update({**{k: ch.get(k) for k in ch}, "Utc": utc})
 
     # ---------------------------------------------------------------- read models
 
@@ -536,8 +531,13 @@ class LiveF1Engine:
                 return [_int(g.get("Status")) or 0 for g in _as_list(s.get("Segments")) if isinstance(g, dict)]
             speeds = line.get("Speeds") or {}
             pos = line.get("Position")
+            # The official starting slot (after penalties), from TimingAppData: the order cars line
+            # up in before timing has positions, never the car number or an old classification.
+            app_line = (self._timing_app.get("Lines") or {}).get(num) or (self._timing_app.get("Lines") or {}).get(str(num).zfill(2)) or {}
+            grid = app_line.get("GridPos") if isinstance(app_line, dict) else None
             board.append({
                 "position": int(pos) if str(pos or "").isdigit() else None,
+                "grid_position": int(grid) if str(grid or "").strip().isdigit() and int(grid) > 0 else None,
                 "driver_number": int(num),
                 **meta,
                 "last_lap_time": _value(line.get("LastLapTime")),
@@ -559,7 +559,8 @@ class LiveF1Engine:
                 "is_crashed": False,
                 "stints": self._stints(num),
             })
-        board.sort(key=lambda d: (d["position"] is None, d["position"] or 0, d["driver_number"]))
+        # Timing position first; before it exists, the official grid slot; car number only as a last tie-break.
+        board.sort(key=lambda d: (d["position"] is None and d["grid_position"] is None, d["position"] or d["grid_position"] or 0, d["driver_number"]))
         return board
 
     def _positions_out(self) -> List[Dict[str, Any]]:

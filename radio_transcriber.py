@@ -119,13 +119,18 @@ class RadioTranscriber:
         return self.provider is not None and self._transcribe is not None
 
     def start(self):
-        if self.enabled and (self._thread is None or not self._thread.is_alive()):
-            self._thread = threading.Thread(target=self._run, daemon=True, name="Radio-Transcriber")
-            self._thread.start()
+        if self.enabled and not hasattr(self, '_threads'):
+            self._threads = []
+            for i in range(3):
+                t = threading.Thread(target=self._run, daemon=True, name=f"Radio-Transcriber-{i}")
+                t.start()
+                self._threads.append(t)
             logger.info(f"Team radio transcription on ({self.provider.name}, {self.provider.model}).")
 
     def stop(self):
-        self._q.put(None)
+        if hasattr(self, '_threads'):
+            for _ in self._threads:
+                self._q.put(None)
 
     def submit(self, url: str, prompt: str):
         if not self.enabled:
@@ -139,6 +144,11 @@ class RadioTranscriber:
     def get(self, url: str) -> Optional[str]:
         with self._lock:
             return self._texts.get(url)
+
+    def done(self, url: str) -> bool:
+        """True once a clip has been through the worker (its text may be None: no speech)."""
+        with self._lock:
+            return url in self._texts
 
     def _run(self):
         while True:
@@ -158,3 +168,4 @@ class RadioTranscriber:
                 if len(self._texts) > 600:
                     for k in list(self._texts)[:200]:
                         self._texts.pop(k, None)
+                        self._queued.discard(k)

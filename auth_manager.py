@@ -33,6 +33,7 @@ class F1AuthManager:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self._token: str = os.environ.get("F1TV_TOKEN", "").strip()
         self._login_session: str = os.environ.get("F1TV_LOGIN_SESSION", "").strip()
         self._last_refresh_time: float = 0.0
@@ -66,9 +67,9 @@ class F1AuthManager:
 
     def get_token(self) -> str:
         """Returns the current valid entitlement token. Auto-refreshes if nearing expiry."""
+        if self.is_expiring(threshold_minutes=60):
+            self._do_refresh()
         with self._lock:
-            if self.is_expiring(threshold_minutes=60):
-                self._do_refresh()
             return self._token
 
     def set_token(self, token: str) -> Dict[str, Any]:
@@ -92,7 +93,9 @@ class F1AuthManager:
                             new_lines.append(line)
                     if not found:
                         new_lines.append(f"F1TV_TOKEN={token}")
-                    ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                    tmp_file = ENV_FILE.with_suffix('.tmp')
+                    tmp_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                    os.replace(tmp_file, ENV_FILE)
                 except Exception as e:
                     logger.warning(f"Could not persist token to .env: {e}")
         return info
@@ -150,46 +153,52 @@ class F1AuthManager:
 
     def refresh(self) -> Dict[str, Any]:
         """External call to force a refresh."""
+        success = self._do_refresh()
         with self._lock:
-            success = self._do_refresh()
             info = self.inspect_token(self._token)
-            info["refreshed"] = success
-            return info
+        info["refreshed"] = success
+        return info
 
     def _do_refresh(self) -> bool:
         """Internal refresh routine using F1TV Entitlement check endpoint."""
-        now = time.time()
-        if now - self._last_refresh_time < 60:
+        with self._refresh_lock:
+            now = time.time()
+            if now - self._last_refresh_time < 60:
+                return False
+
+            self._last_refresh_time = now
+            logger.info("[Auth] Checking token renewal...")
+
+            with self._lock:
+                current_token = self._token
+                login_session = self._login_session
+
+            # Fast HTTP renewal against F1TV Entitlement endpoint
+            try:
+                url = "https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/USER/ENTITLEMENT"
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "entitlementToken": current_token,
+                    "ascendontoken": current_token
+                }
+                cookies = {}
+                if login_session:
+                    cookies["login-session"] = login_session
+
+                res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    new_token = data.get("resultObj", {}).get("entitlementToken")
+                    if new_token:
+                        with self._lock:
+                            self._token = new_token
+                        logger.info("[Auth] Token refreshed successfully via F1TV API.")
+                        return True
+            except Exception as e:
+                logger.warning(f"[Auth] HTTP token refresh failed: {e}")
+
+            logger.warning("[Auth] Token refresh could not acquire a new token. Retaining current token.")
             return False
-
-        self._last_refresh_time = now
-        logger.info("[Auth] Checking token renewal...")
-
-        # Fast HTTP renewal against F1TV Entitlement endpoint
-        try:
-            url = "https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/USER/ENTITLEMENT"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "entitlementToken": self._token,
-                "ascendontoken": self._token
-            }
-            cookies = {}
-            if self._login_session:
-                cookies["login-session"] = self._login_session
-
-            res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                new_token = data.get("resultObj", {}).get("entitlementToken")
-                if new_token:
-                    self._token = new_token
-                    logger.info("[Auth] Token refreshed successfully via F1TV API.")
-                    return True
-        except Exception as e:
-            logger.warning(f"[Auth] HTTP token refresh failed: {e}")
-
-        logger.warning("[Auth] Token refresh could not acquire a new token. Retaining current token.")
-        return False
 
     def _background_check_loop(self):
         """Checks every 15 minutes and refreshes if within 2 hours of expiry."""

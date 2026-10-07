@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import hmac
 import html
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from live_engine import engine
 from auth_manager import auth_manager
 import predictions
+import radio_archive
 
 PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
@@ -37,6 +39,7 @@ app = FastAPI(
 # Public, read-only data: any origin may read it, but without cookies or credentials
 # ("*" with credentials makes Starlette echo every Origin back as allowed).
 app.include_router(predictions.router)
+app.include_router(radio_archive.router)
 
 # Everything else over 1 KB goes out gzipped (OkHttp asks for it and unpacks it on its own).
 # The live feeds below arrive pre-compressed, which this middleware passes through untouched.
@@ -46,7 +49,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "HEAD"],
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -80,14 +83,23 @@ async def privacy_policy():
 # the audience. The timing snapshot is ~58 KB of JSON and ~7 KB gzipped. no-store, so no HTTP cache
 # serves a copy older than that.
 _shared: dict = {}
+_shared_locks: dict = {}
 
 async def _shared_json(request: Request, key: str, produce, ttl: float = 1.0, cache_control: str = "no-store") -> Response:
     now = time.monotonic()
     hit = _shared.get(key)
     if hit is None or now - hit[0] >= ttl:
-        body = json.dumps(await produce(), separators=(",", ":")).encode("utf-8")
-        hit = (now, body, gzip.compress(body, compresslevel=5))
-        _shared[key] = hit
+        lock = _shared_locks.setdefault(key, asyncio.Lock())
+        if lock.locked() and hit is not None:
+            pass
+        else:
+            async with lock:
+                hit = _shared.get(key)
+                now = time.monotonic()
+                if hit is None or now - hit[0] >= ttl:
+                    body = json.dumps(await produce(), separators=(",", ":")).encode("utf-8")
+                    hit = (now, body, gzip.compress(body, compresslevel=5))
+                    _shared[key] = hit
     headers = {"Cache-Control": cache_control, "Vary": "Accept-Encoding"}
     if "gzip" in request.headers.get("accept-encoding", ""):
         return Response(hit[2], media_type="application/json", headers={**headers, "Content-Encoding": "gzip"})
