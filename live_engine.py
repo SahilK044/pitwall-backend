@@ -220,6 +220,7 @@ class LiveF1Engine:
             self._stop_event.set()
         self._is_connected = False
         auth_manager.stop_scheduler()
+        self._transcriber.stop()
         if self._connection:
             try:
                 self._connection.stop()

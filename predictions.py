@@ -95,18 +95,30 @@ class Store:
         if not self.pg:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._pool = queue.Queue(maxsize=30)
-        for stmt in SCHEMA:
+        try:
+            for stmt in SCHEMA:
+                with self._get_conn() as c:
+                    if self.pg:
+                        c.execute(self._sql(stmt))
+                    else:
+                        c.execute(stmt)
+            # Columns added after launch: CREATE TABLE IF NOT EXISTS won't add them to an existing table.
             with self._get_conn() as c:
-                if self.pg:
-                    c.execute(self._sql(stmt))
-                else:
-                    c.execute(stmt)
-        # Columns added after launch: CREATE TABLE IF NOT EXISTS won't add them to an existing table.
-        with self._get_conn() as c:
-            try:
-                c.execute("ALTER TABLE players ADD COLUMN name_changes INTEGER NOT NULL DEFAULT 0")
-            except Exception:
-                pass  # already there
+                try:
+                    c.execute("ALTER TABLE players ADD COLUMN name_changes INTEGER NOT NULL DEFAULT 0")
+                except Exception:
+                    pass  # already there
+        except Exception as e:
+            if self.pg:
+                print(f"[predictions] Postgres setup failed ({e}), switching to local SQLite", flush=True)
+                self.pg = False
+                self.url = ""
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                for stmt in SCHEMA:
+                    with self._get_conn() as c:
+                        c.execute(stmt)
+            else:
+                raise
 
     def _create_conn(self):
         if self.pg:
@@ -120,25 +132,52 @@ class Store:
             c.row_factory = sqlite3.Row
             return c
 
+    def _is_dead(self, c) -> bool:
+        if not self.pg:
+            return False
+        return bool(c.closed or getattr(c, "broken", False))
+
     @contextlib.contextmanager
     def _get_conn(self):
-        try:
-            c = self._pool.get_nowait()
-            if self.pg and c.closed:
+        c = None
+        while c is None:
+            try:
+                cand = self._pool.get_nowait()
+                if self._is_dead(cand):
+                    try:
+                        cand.close()
+                    except Exception:
+                        pass
+                    continue
+                c = cand
+            except queue.Empty:
                 c = self._create_conn()
-        except queue.Empty:
-            c = self._create_conn()
         
+        failed = False
         try:
             yield c
+        except Exception:
+            failed = True
+            if self.pg:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            raise
         finally:
-            if self.pg and c.closed:
-                pass
-            else:
+            if not failed and not self._is_dead(c):
                 try:
                     self._pool.put_nowait(c)
                 except queue.Full:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            elif failed or self._is_dead(c):
+                try:
                     c.close()
+                except Exception:
+                    pass
 
     def _sql(self, q: str) -> str:
         return q.replace("?", "%s") if self.pg else q
@@ -146,38 +185,38 @@ class Store:
     def _run(self, q: str, args=(), conn=None):
         if conn:
             return conn.execute(self._sql(q), args)
-        with self._get_conn() as c:
-            try:
+        try:
+            with self._get_conn() as c:
                 return c.execute(self._sql(q), args)
-            except Exception:
-                if self.pg and c.closed:
-                    with self._get_conn() as c2:
-                        return c2.execute(self._sql(q), args)
-                raise
+        except Exception:
+            if self.pg:
+                with self._get_conn() as c2:
+                    return c2.execute(self._sql(q), args)
+            raise
 
     def _one(self, q: str, args=()) -> Optional[Dict[str, Any]]:
-        with self._get_conn() as c:
-            try:
+        try:
+            with self._get_conn() as c:
                 r = c.execute(self._sql(q), args).fetchone()
-            except Exception:
-                if self.pg and c.closed:
-                    with self._get_conn() as c2:
-                        r = c2.execute(self._sql(q), args).fetchone()
-                else:
-                    raise
-            return dict(r) if r is not None else None
+                return dict(r) if r is not None else None
+        except Exception:
+            if self.pg:
+                with self._get_conn() as c2:
+                    r = c2.execute(self._sql(q), args).fetchone()
+                    return dict(r) if r is not None else None
+            raise
 
     def _all(self, q: str, args=()) -> List[Dict[str, Any]]:
-        with self._get_conn() as c:
-            try:
+        try:
+            with self._get_conn() as c:
                 rows = c.execute(self._sql(q), args).fetchall()
-            except Exception:
-                if self.pg and c.closed:
-                    with self._get_conn() as c2:
-                        rows = c2.execute(self._sql(q), args).fetchall()
-                else:
-                    raise
-            return [dict(r) for r in rows]
+                return [dict(r) for r in rows]
+        except Exception:
+            if self.pg:
+                with self._get_conn() as c2:
+                    rows = c2.execute(self._sql(q), args).fetchall()
+                    return [dict(r) for r in rows]
+            raise
 
     # picks
     def upsert_pick(self, season: str, rnd: int, user: str, podium: List[str]) -> None:
@@ -708,8 +747,20 @@ def start():
     global store, _task
     if not ENABLED:
         return
-    store = Store(DB_PATH, DATABASE_URL)
-    _task = asyncio.get_event_loop().create_task(_scoring_loop())
+    try:
+        store = Store(DB_PATH, DATABASE_URL)
+        print("[predictions] Store initialized", flush=True)
+    except Exception as e:
+        print(f"[predictions] Failed to initialize store ({e})", flush=True)
+        store = None
+    try:
+        loop = asyncio.get_running_loop()
+        _task = loop.create_task(_scoring_loop())
+    except RuntimeError:
+        try:
+            _task = asyncio.get_event_loop().create_task(_scoring_loop())
+        except Exception as e:
+            print(f"[predictions] Could not start scoring loop: {e}", flush=True)
 
 
 async def stop():

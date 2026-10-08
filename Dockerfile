@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # Prevent Python from writing .pyc files & enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PORT=7860
+    PORT=10000
 
 # Set up working directory
 WORKDIR /app
@@ -28,8 +28,12 @@ RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-# Expose Hugging Face Space default port 7860
-EXPOSE 7860
+# Expose default port (Render defaults to 10000, Hugging Face Spaces uses 7860)
+EXPOSE 10000
 
-# Run Uvicorn on 0.0.0.0:7860
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Health check to ensure Uvicorn is serving requests
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-10000}/health || exit 1
+
+# Run Uvicorn listening on dynamically assigned PORT (supports Render $PORT, HF Spaces, etc.)
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]

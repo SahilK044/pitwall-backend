@@ -22,11 +22,23 @@ import legal
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    engine.start()
-    predictions.start()
+    try:
+        engine.start()
+    except Exception as e:
+        print(f"[main] Warning: live engine start encountered error: {e}", flush=True)
+    try:
+        predictions.start()
+    except Exception as e:
+        print(f"[main] Warning: predictions start encountered error: {e}", flush=True)
     yield
-    await predictions.stop()
-    await engine.close()
+    try:
+        await predictions.stop()
+    except Exception as e:
+        print(f"[main] Error stopping predictions: {e}", flush=True)
+    try:
+        await engine.close()
+    except Exception as e:
+        print(f"[main] Error closing engine: {e}", flush=True)
 
 app = FastAPI(
     title="Pitwall LiveF1 Engine",
@@ -191,4 +203,6 @@ async def get_constructor_standings(response: Response):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=7860, reload=True)
+    port = int(os.environ.get("PORT", "10000"))
+    reload = os.environ.get("ENVIRONMENT", "production").lower() == "development"
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload)
