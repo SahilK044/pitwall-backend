@@ -61,10 +61,82 @@ def test_store_fallback_on_postgres_failure(tmp_path):
 
 
 def test_dockerfile_dynamic_port():
-    """Verify Dockerfile uses dynamic PORT variable and exposes 10000."""
+    """Verify Dockerfile uses dynamic PORT variable, exposes 10000, and uses exec."""
     dockerfile_path = os.path.join(os.path.dirname(__file__), "..", "Dockerfile")
     with open(dockerfile_path, "r", encoding="utf-8") as f:
         content = f.read()
     assert "PORT=10000" in content
     assert "EXPOSE 10000" in content
     assert "${PORT:-10000}" in content
+    assert "exec uvicorn" in content
+
+
+def test_auth_scheduler_graceful_stop_and_restart():
+    """Verify auth scheduler stops promptly without waiting 900s, and restarts cleanly."""
+    import time
+    from auth_manager import auth_manager
+
+    auth_manager.start_scheduler()
+    worker = auth_manager._refresh_worker
+    assert worker is not None
+    assert worker.is_alive()
+
+    t0 = time.time()
+    auth_manager.stop_scheduler()
+    assert time.time() - t0 < 1.0  # stopped promptly via event, not waiting 900s
+    assert not worker.is_alive()
+
+    # Re-starting must spawn a new active worker
+    auth_manager.start_scheduler()
+    new_worker = auth_manager._refresh_worker
+    assert new_worker is not None
+    assert new_worker.is_alive()
+    auth_manager.stop_scheduler()
+
+
+def test_radio_transcriber_stop_and_restart():
+    """Verify RadioTranscriber cleans up threads on stop and starts new ones on restart."""
+    import radio_transcriber as rt
+
+    t = rt.RadioTranscriber(provider=rt.Provider("test", "u", "k", "m"), transcribe=lambda u, p: "ok")
+    t.start()
+    assert hasattr(t, "_threads")
+    assert len(t._threads) == 3
+
+    t.stop()
+    assert not hasattr(t, "_threads")
+
+    # Restart should spawn new threads
+    t.start()
+    assert hasattr(t, "_threads")
+    assert len(t._threads) == 3
+    t.stop()
+
+
+def test_store_close_drains_pool(tmp_path):
+    """Verify Store.close() closes and empties connections in pool."""
+    db_file = str(tmp_path / "pool_test.db")
+    store = P.Store(db_file, "")
+    store.upsert_pick("2026", 1, "u1", ["norris", "piastri", "max_verstappen"])
+    # Put a connection in pool
+    with store._get_conn():
+        pass
+    assert not store._pool.empty()
+    store.close()
+    assert store._pool.empty()
+
+
+def test_live_engine_recreates_closed_http_client():
+    """Verify live engine recreates closed client on start."""
+    import asyncio
+    from live_engine import engine
+
+    asyncio.run(engine._client.aclose())
+    assert engine._client.is_closed is True
+
+    engine.start()
+    try:
+        assert engine._client.is_closed is False
+    finally:
+        engine.stop()
+

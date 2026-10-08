@@ -143,6 +143,9 @@ class RadioTranscriber:
         if hasattr(self, '_threads'):
             for _ in self._threads:
                 self._q.put(None)
+            for t in self._threads:
+                t.join(timeout=2.0)
+            del self._threads
 
     def submit(self, url: str, prompt: str):
         if not self.enabled:
@@ -153,6 +156,11 @@ class RadioTranscriber:
             self._queued.add(url)
         self._q.put((url, prompt))
 
+    def is_queued(self, url: str) -> bool:
+        """True while a clip is waiting in the queue or being processed."""
+        with self._lock:
+            return url in self._queued
+
     def get(self, url: str) -> Optional[str]:
         with self._lock:
             return self._texts.get(url)
@@ -161,6 +169,7 @@ class RadioTranscriber:
         """True once a clip has been through the worker (its text may be None: no speech)."""
         with self._lock:
             return url in self._texts
+
 
     def _run(self):
         while True:

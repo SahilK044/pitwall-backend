@@ -203,7 +203,10 @@ class LiveF1Engine:
                     pass
             self._hub_thread.join(timeout=5.0)
         self._stop_event = threading.Event()
+        if getattr(self._client, "is_closed", False):
+            self._client = httpx.AsyncClient(timeout=10.0)
         auth_manager.start_scheduler()
+
         if not self._token:
             # Timing, tyres, radio, race control and weather are public; only car positions and
             # telemetry (CarData.z, Position.z) need an F1 TV Pro token.

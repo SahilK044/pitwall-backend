@@ -34,6 +34,7 @@ class F1AuthManager:
     def __init__(self):
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._token: str = os.environ.get("F1TV_TOKEN", "").strip()
         self._login_session: str = os.environ.get("F1TV_LOGIN_SESSION", "").strip()
         self._last_refresh_time: float = 0.0
@@ -43,18 +44,27 @@ class F1AuthManager:
     def start_scheduler(self):
         """Starts a background daemon thread that checks token expiration periodically."""
         with self._lock:
-            if self._refresh_worker is None or not self._refresh_worker.is_alive():
-                self._running = True
-                self._refresh_worker = threading.Thread(
-                    target=self._background_check_loop,
-                    daemon=True,
-                    name="F1Auth-Scheduler"
-                )
-                self._refresh_worker.start()
-                logger.info("F1 token auto-refresh scheduler started.")
+            if self._refresh_worker is not None and self._refresh_worker.is_alive():
+                self._running = False
+                self._stop_event.set()
+                self._refresh_worker.join(timeout=2.0)
+            self._stop_event.clear()
+            self._running = True
+            self._refresh_worker = threading.Thread(
+                target=self._background_check_loop,
+                daemon=True,
+                name="F1Auth-Scheduler"
+            )
+            self._refresh_worker.start()
+            logger.info("F1 token auto-refresh scheduler started.")
 
     def stop_scheduler(self):
-        self._running = False
+        with self._lock:
+            self._running = False
+            self._stop_event.set()
+            if self._refresh_worker is not None and self._refresh_worker.is_alive():
+                self._refresh_worker.join(timeout=2.0)
+
 
     def current_token(self) -> str:
         """The token held now, without trying a renewal (never blocks on the network)."""
@@ -225,13 +235,15 @@ class F1AuthManager:
     def _background_check_loop(self):
         """Checks every 15 minutes and refreshes if within 2 hours of expiry."""
         logger.info("[Auth] Background token scheduler loop active.")
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             try:
                 self.check_once()
             except Exception as e:
                 logger.error(f"[Auth] Error in background scheduler loop: {e}")
 
-            time.sleep(900)
+            if self._stop_event.wait(timeout=900):
+                break
+
 
 
 # Global singleton instance

@@ -117,11 +117,11 @@ def test_a_failed_clip_is_retried_later_not_saved_as_silence(monkeypatch):
     try:
         t.submit("https://x/c.mp3", "p")
         deadline = time.time() + 3
-        while len(attempts) < 4 and time.time() < deadline:
+        while (t.is_queued("https://x/c.mp3") or len(attempts) < 4) and time.time() < deadline:
             time.sleep(0.02)
-        time.sleep(0.1)
         assert not t.done("https://x/c.mp3")          # not recorded as "no speech"
         t.submit("https://x/c.mp3", "p")              # and can be queued again
+
         deadline = time.time() + 3
         while len(attempts) < 5 and time.time() < deadline:
             time.sleep(0.02)

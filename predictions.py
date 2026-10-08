@@ -113,6 +113,12 @@ class Store:
                 print(f"[predictions] Postgres setup failed ({e}), switching to local SQLite", flush=True)
                 self.pg = False
                 self.url = ""
+                while not self._pool.empty():
+                    try:
+                        old_c = self._pool.get_nowait()
+                        old_c.close()
+                    except Exception:
+                        pass
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                 for stmt in SCHEMA:
                     with self._get_conn() as c:
@@ -120,11 +126,23 @@ class Store:
             else:
                 raise
 
+    def close(self):
+        """Closes all pooled database connections."""
+        while not self._pool.empty():
+            try:
+                c = self._pool.get_nowait()
+                c.close()
+            except Exception:
+                pass
+
     def _create_conn(self):
         if self.pg:
             import psycopg
             from psycopg.rows import dict_row
-            return psycopg.connect(self.url, autocommit=True, row_factory=dict_row, connect_timeout=10, prepare_threshold=None)
+            kwargs = {"autocommit": True, "row_factory": dict_row, "prepare_threshold": None}
+            if "connect_timeout" not in self.url:
+                kwargs["connect_timeout"] = 5
+            return psycopg.connect(self.url, **kwargs)
         else:
             c = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
             c.execute("PRAGMA journal_mode=WAL")
@@ -133,11 +151,17 @@ class Store:
             return c
 
     def _is_dead(self, c) -> bool:
-        if not self.pg:
+        if self.pg:
+            if isinstance(c, sqlite3.Connection):
+                return True
+            return bool(getattr(c, "closed", False) or getattr(c, "broken", False))
+        else:
+            if not isinstance(c, sqlite3.Connection):
+                return True
             return False
-        return bool(c.closed or getattr(c, "broken", False))
 
     @contextlib.contextmanager
+
     def _get_conn(self):
         c = None
         while c is None:
@@ -764,7 +788,12 @@ def start():
 
 
 async def stop():
+    global store
     if _task:
         _task.cancel()
     if data.client:
         await data.client.aclose()
+    if store:
+        store.close()
+        store = None
+
