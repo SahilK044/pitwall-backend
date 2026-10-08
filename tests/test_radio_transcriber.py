@@ -97,3 +97,34 @@ def test_engine_sends_live_clips_not_the_snapshot_backlog():
     import asyncio
     radio = asyncio.run(e.get_live_timing())["team_radio"]
     assert [r["transcript"] for r in radio] == [None, "Box box."]
+
+
+def test_noisy_but_confident_speech_is_kept():
+    noisy = {"text": "Box box, box this lap.", "segments": [{"text": "Box box, box this lap.", "no_speech_prob": 0.7, "avg_logprob": -0.3}]}
+    assert rt.text_from_response(noisy) == "Box box, box this lap."
+
+
+def test_a_failed_clip_is_retried_later_not_saved_as_silence(monkeypatch):
+    monkeypatch.setattr(rt.time, "sleep", lambda s: None)
+    attempts = []
+
+    def flaky(url, prompt):
+        attempts.append(url)
+        raise RuntimeError("provider down")
+
+    t = rt.RadioTranscriber(provider=rt.Provider("test", "u", "k", "m"), transcribe=flaky)
+    t.start()
+    try:
+        t.submit("https://x/c.mp3", "p")
+        deadline = time.time() + 3
+        while len(attempts) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.1)
+        assert not t.done("https://x/c.mp3")          # not recorded as "no speech"
+        t.submit("https://x/c.mp3", "p")              # and can be queued again
+        deadline = time.time() + 3
+        while len(attempts) < 5 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(attempts) >= 5
+    finally:
+        t.stop()

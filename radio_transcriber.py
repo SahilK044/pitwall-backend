@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -79,8 +80,10 @@ def clean(text: Optional[str]) -> Optional[str]:
 def text_from_response(data: Dict) -> Optional[str]:
     segments = data.get("segments") or []
     if segments:
-        # Keep only what Whisper is confident is speech.
-        spoken = [s.get("text", "") for s in segments if (s.get("no_speech_prob") or 0) < 0.6]
+        # Drop only what Whisper is sure is not speech: radio is noisy, and a 0.6 cut threw away
+        # most real messages. A segment it decoded confidently counts even when the noise is high.
+        spoken = [s.get("text", "") for s in segments
+                  if (s.get("no_speech_prob") or 0) < 0.85 or (s.get("avg_logprob") or -9) > -0.6]
         return clean(" ".join(spoken))
     return clean(data.get("text"))
 
@@ -97,9 +100,18 @@ def whisper_call(provider: Provider) -> Callable[[str, str], Optional[str]]:
                 data={"model": provider.model, "language": "en", "temperature": "0",
                       "response_format": "verbose_json", "prompt": prompt},
             )
+            if r.status_code == 429:
+                raise RateLimited(float(r.headers.get("retry-after") or 20))
             r.raise_for_status()
             return text_from_response(r.json())
     return run
+
+
+class RateLimited(Exception):
+    """The provider asked us to slow down; [wait] seconds before trying again."""
+    def __init__(self, wait: float):
+        super().__init__(f"rate limited, retry in {wait:.0f}s")
+        self.wait = wait
 
 
 class RadioTranscriber:
@@ -156,14 +168,23 @@ class RadioTranscriber:
             if item is None:
                 return
             url, prompt = item
-            text = None
-            for attempt in range(2):
+            text, ok = None, False
+            for attempt in range(4):
                 try:
                     text = self._transcribe(url, prompt)
+                    ok = True
                     break
-                except Exception as e:  # network or provider error: one retry, then leave it untranscribed
-                    logger.warning(f"Radio transcription failed ({attempt + 1}/2): {e}")
+                except RateLimited as e:   # the free tier's per-minute cap: wait it out, then retry
+                    logger.warning(f"Radio transcription rate limited ({attempt + 1}/4), waiting {e.wait:.0f}s")
+                    time.sleep(min(60.0, e.wait))
+                except Exception as e:     # network or provider error: back off and retry
+                    logger.warning(f"Radio transcription failed ({attempt + 1}/4): {e}")
+                    time.sleep(3 * (attempt + 1))
             with self._lock:
+                if not ok:
+                    # A failure is not "no speech": forget it so a later request tries again.
+                    self._queued.discard(url)
+                    continue
                 self._texts[url] = text
                 if len(self._texts) > 600:
                     for k in list(self._texts)[:200]:

@@ -76,6 +76,15 @@ class UsernameTaken(Exception):
     pass
 
 
+class UsernameLimit(Exception):
+    """The player has used all their username changes."""
+
+
+# A username can be changed this many times after it is first chosen (stored with the player, so
+# reinstalling the app or clearing its data doesn't reset it for the same install id).
+USERNAME_CHANGES = 3
+
+
 class Store:
     """Picks, results and usernames. Postgres when DATABASE_URL is set, otherwise SQLite at PREDICTIONS_DB.
     The SQL is written once, with ? placeholders, and runs on both. One connection per thread."""
@@ -92,6 +101,12 @@ class Store:
                     c.execute(self._sql(stmt))
                 else:
                     c.execute(stmt)
+        # Columns added after launch: CREATE TABLE IF NOT EXISTS won't add them to an existing table.
+        with self._get_conn() as c:
+            try:
+                c.execute("ALTER TABLE players ADD COLUMN name_changes INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # already there
 
     def _create_conn(self):
         if self.pg:
@@ -253,6 +268,27 @@ class Store:
             (season, user)) or {}
         return {"points": int(r.get("pts") or 0), "correct": int(r.get("hits") or 0), "scored": int(r.get("scored") or 0)}
 
+    def history(self, season: str, user: str) -> List[Dict[str, Any]]:
+        """Every pick this player made this season, newest first, with the official podium and the
+        points once scored."""
+        rows = self._all(
+            """SELECT p.round AS round, p.p1, p.p2, p.p3, p.points, p.hits, r.podium AS podium, r.race_name AS race_name
+               FROM podium_picks p LEFT JOIN podium_results r ON r.season = p.season AND r.round = p.round
+               WHERE p.season=? AND p.user_id=? ORDER BY p.round DESC""", (season, user))
+        return [{"round": int(r["round"]), "race_name": r["race_name"], "mine": [r["p1"], r["p2"], r["p3"]],
+                 "podium": r["podium"].split(",") if r["podium"] else [], "points": r["points"], "hits": r["hits"]} for r in rows]
+
+    @staticmethod
+    def streaks(history: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Scoring streaks over the scored races in round order: the current run of races that earned
+        points, and the best run this season."""
+        scored = sorted((h for h in history if h["points"] is not None), key=lambda h: h["round"])
+        best = run = 0
+        for h in scored:
+            run = run + 1 if h["points"] > 0 else 0
+            best = max(best, run)
+        return {"streak": run, "best_streak": best}
+
     def rank_of(self, season: str, user: str) -> Optional[int]:
         """1-based leaderboard position, or None before this user has a scored pick."""
         me = self.user_total(season, user)
@@ -269,18 +305,31 @@ class Store:
         r = self._one("SELECT username FROM players WHERE user_id=?", (user,))
         return r["username"] if r else None
 
-    def set_username(self, user: str, name: str) -> None:
-        """Claims [name] for [user]; UsernameTaken when someone else has it (any letter case)."""
+    def changes_left(self, user: str) -> int:
+        r = self._one("SELECT name_changes FROM players WHERE user_id=?", (user,))
+        return USERNAME_CHANGES - int(r["name_changes"] or 0) if r else USERNAME_CHANGES
+
+    def set_username(self, user: str, name: str) -> int:
+        """Claims [name] for [user] and returns the changes left. The first name is free; each change
+        after it uses one of USERNAME_CHANGES. UsernameTaken when someone else has it (any letter case),
+        UsernameLimit when the changes are used up. Re-sending the current name changes nothing."""
         key, now = name.lower(), time.time()
         owner = self._one("SELECT user_id FROM players WHERE username_key=?", (key,))
         if owner and owner["user_id"] != user:
             raise UsernameTaken()
+        mine = self._one("SELECT username, name_changes FROM players WHERE user_id=?", (user,))
+        if mine and mine["username"] == name:
+            return USERNAME_CHANGES - int(mine["name_changes"] or 0)
+        used = int(mine["name_changes"] or 0) + 1 if mine else 0
+        if used > USERNAME_CHANGES:
+            raise UsernameLimit()
         try:
             self._run(
-                """INSERT INTO players (user_id, username, username_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO players (user_id, username, username_key, created_at, updated_at, name_changes) VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT (user_id) DO UPDATE SET username = excluded.username, username_key = excluded.username_key,
-                     updated_at = excluded.updated_at""",
-                (user, name, key, now, now))
+                     updated_at = excluded.updated_at, name_changes = excluded.name_changes""",
+                (user, name, key, now, now, used))
+            return USERNAME_CHANGES - used
         except Exception as e:                        # lost a race for the same name
             if "unique" in str(e).lower():
                 raise UsernameTaken() from e
@@ -490,8 +539,9 @@ async def current(response: Response, x_pitwall_user: Optional[str] = Header(Non
     race = await data.next_race()
     response.headers["Cache-Control"] = "private, max-age=10"
     username = await asyncio.to_thread(store.username, user) if user else None
+    left = await asyncio.to_thread(store.changes_left, user) if user else USERNAME_CHANGES
     if race is None:
-        return {"open": False, "race": None, "username": username}
+        return {"open": False, "race": None, "username": username, "username_changes_left": left}
     rnd = int(race["round"])
     season = await data.season()
     lock_at = data.start_of(race)
@@ -505,6 +555,7 @@ async def current(response: Response, x_pitwall_user: Optional[str] = Header(Non
         "distribution": dist["drivers"],
         "mine": mine,
         "username": username,
+        "username_changes_left": left,
     }
 
 
@@ -581,11 +632,35 @@ async def set_username(body: UsernameIn, request: Request, x_pitwall_user: Optio
     name = check_username(body.username)            # before the limit: a typo shouldn't use up a try
     _guard(request, user, "name", 5)
     try:
-        await asyncio.to_thread(store.set_username, user, name)
+        left = await asyncio.to_thread(store.set_username, user, name)
     except UsernameTaken:
         raise HTTPException(409, "That username is taken")
+    except UsernameLimit:
+        raise HTTPException(403, f"You've used all {USERNAME_CHANGES} username changes")
     _board_cache.clear()
-    return {"ok": True, "username": name}
+    return {"ok": True, "username": name, "changes_left": left}
+
+
+@router.get("/history")
+async def history(response: Response, x_pitwall_user: Optional[str] = Header(None)):
+    """The caller's picks this season with results and points, plus totals, accuracy and streaks."""
+    _require()
+    user = _user(x_pitwall_user, required=True)
+    season = await data.season()
+    response.headers["Cache-Control"] = "private, max-age=30"
+    rows = await asyncio.to_thread(store.history, season, user)
+    total = await asyncio.to_thread(store.user_total, season, user)
+    scored = [h for h in rows if h["points"] is not None]
+    places = 3 * len(scored)
+    return {
+        "picks": rows,
+        "points": total["points"],
+        "correct": total["correct"],
+        "scored": total["scored"],
+        # Share of podium places called exactly right, over the scored races.
+        "accuracy": round(total["correct"] / places, 3) if places else None,
+        **Store.streaks(rows),
+    }
 
 
 # ---------------------------------------------------------------- automatic scoring

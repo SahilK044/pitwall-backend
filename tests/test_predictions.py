@@ -143,3 +143,31 @@ def test_usernames_are_unique_and_checked(client):
 def test_disabled_is_404(client, monkeypatch):
     monkeypatch.setattr(P, "ENABLED", False)
     assert client.get("/api/v1/predict/current").status_code == 404
+
+
+def test_three_username_changes_then_locked(client):
+    name = lambda u: client.post("/api/v1/predict/username", json={"username": u}, headers=h(7))
+    first = name("Grid_Walk")
+    assert first.status_code == 200 and first.json()["changes_left"] == 3     # choosing a name is free
+    assert name("Grid_Walk").json()["changes_left"] == 3                      # re-sending it changes nothing
+    assert [name(u).json()["changes_left"] for u in ("Turn_One", "Turn_Two", "Turn_Three")] == [2, 1, 0]
+    P._buckets.clear()                                                         # past the per-minute flood guard
+    locked = name("Turn_Four")
+    assert locked.status_code == 403 and "3 username changes" in locked.json()["detail"]
+    cur = client.get("/api/v1/predict/current", headers=h(7)).json()
+    assert cur["username"] == "Turn_Three" and cur["username_changes_left"] == 0
+
+
+def test_history_accuracy_and_streaks(client):
+    P.store.upsert_pick("2026", 1, uid(8), ["norris", "piastri", "max_verstappen"])
+    asyncio.run(P.score_finished_races())
+    hist = client.get("/api/v1/predict/history", headers=h(8)).json()
+    assert hist["picks"][0]["mine"] == ["norris", "piastri", "max_verstappen"]
+    assert hist["picks"][0]["podium"] == ["norris", "piastri", "max_verstappen"] and hist["picks"][0]["points"] == 20
+    assert hist["accuracy"] == 1.0 and hist["streak"] == 1 and hist["best_streak"] == 1
+
+
+def test_streaks_count_runs_of_scoring_races():
+    rows = [{"round": r, "points": p} for r, p in [(1, 5), (2, 0), (3, 2), (4, 9), (5, 4), (6, None)]]
+    assert P.Store.streaks(rows) == {"streak": 3, "best_streak": 3}
+    assert P.Store.streaks([{"round": 1, "points": 5}, {"round": 2, "points": 0}]) == {"streak": 0, "best_streak": 1}

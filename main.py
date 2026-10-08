@@ -17,6 +17,7 @@ from live_engine import engine
 from auth_manager import auth_manager
 import predictions
 import radio_archive
+import legal
 
 PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
@@ -40,6 +41,7 @@ app = FastAPI(
 # ("*" with credentials makes Starlette echo every Origin back as allowed).
 app.include_router(predictions.router)
 app.include_router(radio_archive.router)
+app.include_router(legal.router)
 
 # Everything else over 1 KB goes out gzipped (OkHttp asks for it and unpacks it on its own).
 # The live feeds below arrive pre-compressed, which this middleware passes through untouched.
