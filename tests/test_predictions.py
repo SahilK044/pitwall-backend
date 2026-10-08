@@ -53,7 +53,7 @@ def make_store(tmp_path):
     if not url:
         return P.Store(str(tmp_path / "p.db"))
     store = P.Store("", url)
-    for table in ("podium_picks", "podium_results", "players"):
+    for table in ("podium_picks", "podium_results", "players", "race_ratings"):
         store._run(f"DELETE FROM {table}")
     return store
 
@@ -63,7 +63,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(P, "ENABLED", True)
     monkeypatch.setattr(P, "store", make_store(tmp_path))
     monkeypatch.setattr(P, "data", FakeData())
-    P._buckets.clear(); P._dist_cache.clear(); P._board_cache.clear()
+    P._buckets.clear(); P._dist_cache.clear(); P._board_cache.clear(); P._ratings_cache.clear()
     app = FastAPI()
     app.include_router(P.router)
     return TestClient(app)
@@ -171,3 +171,18 @@ def test_streaks_count_runs_of_scoring_races():
     rows = [{"round": r, "points": p} for r, p in [(1, 5), (2, 0), (3, 2), (4, 9), (5, 4), (6, None)]]
     assert P.Store.streaks(rows) == {"streak": 3, "best_streak": 3}
     assert P.Store.streaks([{"round": 1, "points": 5}, {"round": 2, "points": 0}]) == {"streak": 0, "best_streak": 1}
+
+
+def test_fans_rate_finished_races(client):
+    rate = lambda rnd, stars, n=1: client.post("/api/v1/predict/rating", json={"round": rnd, "stars": stars}, headers=h(n)).status_code
+    assert rate(2, 4) == 409                              # not run yet
+    assert rate(1, 0) == 422 and rate(1, 6) == 422        # 1 to 5 stars
+    assert rate(9, 3) == 404                              # no such round
+    assert client.post("/api/v1/predict/rating", json={"round": 1, "stars": 3}).status_code == 400   # no user header
+    assert rate(1, 5, 1) == 200 and rate(1, 2, 2) == 200
+    assert rate(1, 4, 1) == 200                           # re-rating replaces, not adds
+    out = client.get("/api/v1/predict/ratings", headers=h(1)).json()
+    assert out["ratings"]["1"] == {"average": 3.0, "count": 2, "mine": 4}
+    assert "2" not in out["ratings"]
+    anon = client.get("/api/v1/predict/ratings").json()
+    assert anon["ratings"]["1"]["mine"] is None and anon["ratings"]["1"]["count"] == 2

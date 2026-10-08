@@ -69,6 +69,11 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS players (
         user_id TEXT PRIMARY KEY, username TEXT NOT NULL, username_key TEXT NOT NULL UNIQUE,
         created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL)""",
+    # Fans' 1-5 star ratings of finished races, one per fan per race (re-rating replaces it).
+    """CREATE TABLE IF NOT EXISTS race_ratings (
+        season TEXT NOT NULL, round INTEGER NOT NULL, user_id TEXT NOT NULL, stars INTEGER NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (season, round, user_id))""",
 ]
 
 
@@ -363,6 +368,23 @@ class Store:
                ) t WHERE t.pts > ?""", (season, me["points"]))
         return int(r["n"]) + 1
 
+    # race ratings
+    def rate(self, season: str, rnd: int, user: str, stars: int) -> None:
+        now = time.time()
+        self._run(
+            """INSERT INTO race_ratings (season, round, user_id, stars, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (season, round, user_id) DO UPDATE SET stars = excluded.stars, updated_at = excluded.updated_at""",
+            (season, rnd, user, stars, now, now))
+
+    def rating_totals(self, season: str) -> Dict[int, Dict[str, Any]]:
+        """Per rated round: the fans' average (1 decimal) and how many rated it."""
+        rows = self._all("SELECT round, AVG(stars) AS avg, COUNT(*) AS n FROM race_ratings WHERE season=? GROUP BY round", (season,))
+        return {int(r["round"]): {"average": round(float(r["avg"]), 1), "count": int(r["n"])} for r in rows}
+
+    def my_ratings(self, season: str, user: str) -> Dict[int, int]:
+        rows = self._all("SELECT round, stars FROM race_ratings WHERE season=? AND user_id=?", (season, user))
+        return {int(r["round"]): int(r["stars"]) for r in rows}
+
     # usernames
     def username(self, user: str) -> Optional[str]:
         r = self._one("SELECT username FROM players WHERE user_id=?", (user,))
@@ -580,6 +602,11 @@ class PickIn(BaseModel):
     podium: List[str] = Field(..., min_length=3, max_length=3)
 
 
+class RatingIn(BaseModel):
+    round: int = Field(..., ge=1, le=30)
+    stars: int = Field(..., ge=1, le=5)
+
+
 class UsernameIn(BaseModel):
     username: str = Field(..., min_length=1, max_length=32)
 
@@ -724,6 +751,43 @@ async def history(response: Response, x_pitwall_user: Optional[str] = Header(Non
         "accuracy": round(total["correct"] / places, 3) if places else None,
         **Store.streaks(rows),
     }
+
+
+_ratings_cache: Dict[Any, Any] = {}
+# A race can be rated once it's over: lights out plus this long.
+RATE_AFTER_S = 2 * 3600
+
+
+@router.post("/rating")
+async def rate_race(body: RatingIn, request: Request, x_pitwall_user: Optional[str] = Header(None)):
+    """A fan's 1-5 star rating of a finished race; sending again replaces it."""
+    _require()
+    user = _user(x_pitwall_user, required=True)
+    _guard(request, user, "rate", 20)
+    race = await data.race(body.round)
+    if race is None:
+        raise HTTPException(404, "No such round")
+    if time.time() < data.start_of(race) + RATE_AFTER_S:
+        raise HTTPException(409, "You can rate this race once it's over")
+    season = await data.season()
+    await asyncio.to_thread(store.rate, season, body.round, user, body.stars)
+    _ratings_cache.pop(season, None)
+    return {"ok": True, "round": body.round, "stars": body.stars}
+
+
+@router.get("/ratings")
+async def race_ratings(response: Response, x_pitwall_user: Optional[str] = Header(None)):
+    """Every rated race this season: the fans' average, the count, and the caller's own stars."""
+    _require()
+    user = _user(x_pitwall_user)
+    season = await data.season()
+    response.headers["Cache-Control"] = "private, max-age=30"
+    hit = _ratings_cache.get(season)
+    if not hit or time.time() - hit[0] > 30:
+        hit = (time.time(), await asyncio.to_thread(store.rating_totals, season))
+        _ratings_cache[season] = hit
+    mine = await asyncio.to_thread(store.my_ratings, season, user) if user else {}
+    return {"season": season, "ratings": {str(rnd): {**t, "mine": mine.get(rnd)} for rnd, t in hit[1].items()}}
 
 
 # ---------------------------------------------------------------- automatic scoring
