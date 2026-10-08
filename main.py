@@ -19,7 +19,6 @@ import predictions
 import radio_archive
 import legal
 
-PRIVACY_HTML_PATH = Path(__file__).parent / "privacy.html"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -68,17 +67,6 @@ async def root():
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "ok", "service": "pitwall-livef1", "feed": engine.health()}
-
-@app.api_route("/privacy", methods=["GET", "HEAD"], response_class=HTMLResponse)
-async def privacy_policy():
-    if PRIVACY_HTML_PATH.exists():
-        content = PRIVACY_HTML_PATH.read_text(encoding="utf-8")
-        return HTMLResponse(
-            content=content,
-            status_code=200,
-            headers={"Cache-Control": "public, max-age=3600"}
-        )
-    return HTMLResponse(content="<h1>Privacy Policy Not Found</h1>", status_code=404)
 
 # Every poller shares one rendering per second, both as JSON and gzipped: during a race each app
 # polls these every second or few, so building (and compressing) them per request would scale with

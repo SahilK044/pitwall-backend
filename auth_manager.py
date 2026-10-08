@@ -63,12 +63,18 @@ class F1AuthManager:
     def public_status(self) -> Dict[str, Any]:
         """Expiry only. The JWT also names the account holder; that is never served."""
         info = self.inspect_token(self._token)
-        return {k: info.get(k) for k in ("valid", "error", "exp_utc", "iat_utc", "remaining_seconds", "is_expired")}
+        out = {k: info.get(k) for k in ("valid", "error", "exp_utc", "iat_utc", "remaining_seconds", "is_expired")}
+        # "valid" means usable: an expired token is not, whatever its format.
+        if out.get("is_expired"):
+            out["valid"] = False
+            out["error"] = out.get("error") or "Token expired"
+        return out
 
     def get_token(self) -> str:
-        """Returns the current valid entitlement token. Auto-refreshes if nearing expiry."""
+        """The current entitlement token, renewed first if it is close to expiry. Never waits on a
+        renewal already running elsewhere: the live feed calls this when it (re)connects."""
         if self.is_expiring(threshold_minutes=60):
-            self._do_refresh()
+            self._do_refresh(wait=False)
         with self._lock:
             return self._token
 
@@ -159,55 +165,69 @@ class F1AuthManager:
         info["refreshed"] = success
         return info
 
-    def _do_refresh(self) -> bool:
-        """Internal refresh routine using F1TV Entitlement check endpoint."""
-        with self._refresh_lock:
-            now = time.time()
-            if now - self._last_refresh_time < 60:
-                return False
-
-            self._last_refresh_time = now
-            logger.info("[Auth] Checking token renewal...")
-
-            with self._lock:
-                current_token = self._token
-                login_session = self._login_session
-
-            # Fast HTTP renewal against F1TV Entitlement endpoint
-            try:
-                url = "https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/USER/ENTITLEMENT"
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    "entitlementToken": current_token,
-                    "ascendontoken": current_token
-                }
-                cookies = {}
-                if login_session:
-                    cookies["login-session"] = login_session
-
-                res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
-                if res.status_code == 200:
-                    data = res.json()
-                    new_token = data.get("resultObj", {}).get("entitlementToken")
-                    if new_token:
-                        with self._lock:
-                            self._token = new_token
-                        logger.info("[Auth] Token refreshed successfully via F1TV API.")
-                        return True
-            except Exception as e:
-                logger.warning(f"[Auth] HTTP token refresh failed: {e}")
-
-            logger.warning("[Auth] Token refresh could not acquire a new token. Retaining current token.")
+    def _do_refresh(self, wait: bool = True) -> bool:
+        """Internal refresh routine using F1TV Entitlement check endpoint. Callers must NOT hold
+        self._lock: it is taken briefly inside (it is not re-entrant). With [wait] False it returns
+        at once if another renewal is in progress."""
+        if not self._refresh_lock.acquire(blocking=wait):
             return False
+        try:
+            return self._renew()
+        finally:
+            self._refresh_lock.release()
+
+    def _renew(self) -> bool:
+        now = time.time()
+        if now - self._last_refresh_time < 60:
+            return False
+
+        self._last_refresh_time = now
+        logger.info("[Auth] Checking token renewal...")
+
+        with self._lock:
+            current_token = self._token
+            login_session = self._login_session
+
+        # Fast HTTP renewal against F1TV Entitlement endpoint
+        try:
+            url = "https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/USER/ENTITLEMENT"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "entitlementToken": current_token,
+                "ascendontoken": current_token
+            }
+            cookies = {}
+            if login_session:
+                cookies["login-session"] = login_session
+
+            res = requests.get(url, headers=headers, cookies=cookies, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                new_token = data.get("resultObj", {}).get("entitlementToken")
+                if new_token:
+                    with self._lock:
+                        self._token = new_token
+                    logger.info("[Auth] Token refreshed successfully via F1TV API.")
+                    return True
+        except Exception as e:
+            logger.warning(f"[Auth] HTTP token refresh failed: {e}")
+
+        logger.warning("[Auth] Token refresh could not acquire a new token. Retaining current token.")
+        return False
+
+    def check_once(self) -> None:
+        """One pass of the background check: renew when within 2 hours of expiry. No self._lock
+        here: _do_refresh takes it itself (holding it first deadlocked this thread, and behind it
+        every caller of get_token and set_token, once expiry neared)."""
+        if self.is_expiring(threshold_minutes=120):
+            self._do_refresh()
 
     def _background_check_loop(self):
         """Checks every 15 minutes and refreshes if within 2 hours of expiry."""
         logger.info("[Auth] Background token scheduler loop active.")
         while self._running:
             try:
-                if self.is_expiring(threshold_minutes=120):
-                    with self._lock:
-                        self._do_refresh()
+                self.check_once()
             except Exception as e:
                 logger.error(f"[Auth] Error in background scheduler loop: {e}")
 
